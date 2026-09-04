@@ -310,6 +310,23 @@ pub(crate) fn decode_form_path(repo_root: &Path, form_xml_path: &Path) -> Option
 }
 
 
+/// Владелец формы в КАНОНИЧЕСКОМ виде (`Document.X`, как в `data_links` и
+/// `metadata_objects`) и имя формы. `decode_form_path` отдаёт владельца в
+/// формате папки выгрузки (`Documents.X`) — так его хранит `metadata_forms`;
+/// рёбрам графа данных нужен тип в единственном числе, иначе реверс-поиск по
+/// `from_object` не совпадёт с остальными рёбрами объекта. Общая форма —
+/// `CommonForm.<Имя>`, имя формы равно имени объекта.
+pub(crate) fn form_owner_canonical(repo_root: &Path, form_xml_path: &Path) -> Option<(String, String)> {
+    let (owner_plural, form_name) = decode_form_path(repo_root, form_xml_path)?;
+    let (folder, name) = owner_plural.split_once('.')?;
+    let meta_type = ALL_OBJECT_FOLDERS
+        .iter()
+        .find(|(f, _)| *f == folder)
+        .map(|(_, t)| *t)?;
+    Some((format!("{}.{}", meta_type, name), form_name))
+}
+
+
 /// Ближайший предок пути (в пределах `repo_root`), содержащий `Configuration.xml`
 /// — sub-config, которому принадлежит файл. Нужен точечным веткам, чтобы взять
 /// `extension_name`/`config_version` без полного обхода репо. `None`, если ни у

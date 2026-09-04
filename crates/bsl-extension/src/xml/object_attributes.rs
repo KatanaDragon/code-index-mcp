@@ -71,6 +71,10 @@ pub struct DataLinkEdge {
     /// `recorder` — движение документа в регистр (документ → регистр),
     /// источник — `<RegisterRecords>` в XML документа. У него `from_path`
     /// пуст (это не реквизит), `to_object` — полное имя регистра.
+    /// Рёбра из описаний форм (`xml::forms`): `form_attr` — тип реквизита
+    /// формы (или колонки реквизита-таблицы), `form_param` — тип параметра
+    /// формы, `form_main_table` — основная таблица динамического списка.
+    /// У них `from_path` начинается с `Form.<ИмяФормы>.`.
     pub link_kind: &'static str,
     /// Ребро из составного типа (перечислено несколько конкретных типов).
     pub is_composite: bool,
@@ -326,46 +330,51 @@ fn emit_field_edges(f: &FieldAccum, tabular: Option<&str>, out: &mut Vec<DataLin
         Some(n) if !n.is_empty() => n,
         _ => return,
     };
+    let from_path = match tabular {
+        Some(ts) => format!("{}.{}", ts, name),
+        None => name.clone(),
+    };
+    out.extend(edges_from_types(from_path, &f.types, f.kind));
+}
+
+/// Рёбра графа данных по перечню типов одного поля (`<v8:Type>` подряд).
+///
+/// Общая часть для реквизитов объектов и для реквизитов/параметров форм:
+/// классификация типов (`classify_type`), дедуп целей составного типа,
+/// страховочный cap на патологический перечень. Примитивы и платформенные
+/// типы рёбер не дают — пустой результат.
+pub fn edges_from_types(from_path: String, types: &[String], kind: &'static str) -> Vec<DataLinkEdge> {
     // Классифицируем все типы поля; оставляем только ссылочные.
-    let mut targets: Vec<(String, bool)> = f
-        .types
-        .iter()
-        .filter_map(|t| classify_type(t))
-        .collect();
+    let mut targets: Vec<(String, bool)> = types.iter().filter_map(|t| classify_type(t)).collect();
     if targets.is_empty() {
-        return;
+        return Vec::new();
     }
     // Дедуп (составной тип может повторять одну цель).
     targets.sort();
     targets.dedup();
 
-    let from_path = match tabular {
-        Some(ts) => format!("{}.{}", ts, name),
-        None => name.clone(),
-    };
-
     // Страховочный cap: патологический перечень → один терминальный узел.
     if targets.len() > MAX_COMPOSITE_TARGETS {
-        out.push(DataLinkEdge {
+        return vec![DataLinkEdge {
             from_path,
             to_object: "*Multiple".to_string(),
-            link_kind: f.kind,
+            link_kind: kind,
             is_composite: true,
             is_universal: true,
-        });
-        return;
+        }];
     }
 
     let is_composite = targets.len() > 1;
-    for (to_object, is_universal) in targets {
-        out.push(DataLinkEdge {
+    targets
+        .into_iter()
+        .map(|(to_object, is_universal)| DataLinkEdge {
             from_path: from_path.clone(),
             to_object,
-            link_kind: f.kind,
+            link_kind: kind,
             is_composite,
             is_universal,
-        });
-    }
+        })
+        .collect()
 }
 
 /// Классифицировать строку типа из `<v8:Type>`.

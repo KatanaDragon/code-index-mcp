@@ -7,8 +7,14 @@
 // - `configuration` — Configuration.xml: список всех объектов конфигурации
 //   (Catalog/Document/InformationRegister/...) с их именами, синонимами
 //   и UUID. Источник для таблицы `metadata_objects`.
-// - `forms` — *.xml в Forms/: имена обработчиков событий формы. Источник
-//   для `metadata_forms`.
+// - `forms` — *.xml в Forms/: имена обработчиков событий формы (источник
+//   для `metadata_forms`) и ссылки формы на объекты — типы реквизитов и
+//   параметров, основная таблица и запрос динамического списка (доп. рёбра
+//   `data_links` видов `form_*`, обращения `form_query` в
+//   `metadata_code_usages`).
+// - `dcs` — схемы компоновки данных (`Templates/<Имя>/Ext/Template.xml` с
+//   корнем `DataCompositionSchema`): тексты запросов наборов данных →
+//   обращения `dcs_query` в `metadata_code_usages`.
 // - `event_subscriptions` — *.xml в EventSubscriptions/: связь
 //   «событие → модуль.процедура». Источник для `event_subscriptions`.
 // - `object_attributes` — XML отдельных объектов (Catalogs/<X>.xml и т.д.):
@@ -21,6 +27,7 @@
 
 pub mod config_dump_info;
 pub mod configuration;
+pub mod dcs;
 // `edt_mdo` — формат 1C:EDT (`.mdo`): структура объектов, связи данных,
 // синоним/шапка. Заполняет те же таблицы, что и формат Конфигуратора.
 pub mod edt_mdo;

@@ -10,8 +10,9 @@ use crate::xml::config_dump_info::{
 };
 use crate::xml::configuration::parse_configuration_file;
 use crate::xml::event_subscriptions::parse_event_subscription_file;
-use crate::xml::forms::parse_form_file;
-use crate::code_usages::extract_code_usages;
+use crate::xml::dcs::{is_dcs_template, parse_dcs_queries};
+use crate::xml::forms::{parse_form_file, parse_form_refs_file, FormRefs};
+use crate::code_usages::{extract_code_usages, extract_query_usages};
 use crate::xml::metadata_refs::{
     parse_defined_type_targets_file, parse_exchange_plan_content_file,
     parse_functional_option_content_file, parse_functional_option_location_file,
@@ -670,8 +671,11 @@ pub(crate) fn index_role_rights(repo_root: &Path, conn: &rusqlite::Connection) -
 pub(crate) fn index_metadata_code_usages(repo_root: &Path, conn: &rusqlite::Connection) -> Result<()> {
     let _ = conn.execute("ROLLBACK", []);
     conn.execute("BEGIN", [])?;
+    // Только виды из `.bsl`: обращения из макетов СКД (`dcs_query`) и форм
+    // (`form_query`) ведут свои фазы XML-слоя и сносят свои строки сами.
     conn.execute(
-        "DELETE FROM metadata_code_usages WHERE repo = ?",
+        "DELETE FROM metadata_code_usages WHERE repo = ? \
+         AND usage_kind IN ('manager', 'ref_type', 'query')",
         params![REPO_DEFAULT],
     )?;
     let mut stmt = conn.prepare(
@@ -1463,4 +1467,246 @@ pub(crate) fn index_event_subscriptions(repo_root: &Path, conn: &rusqlite::Conne
     ));
     tracing::info!("event_subscriptions: проиндексировано {} подписок", count);
     Ok(())
+}
+
+
+/// Ссылки форм на объекты (XML-слой): рёбра `data_links` видов `form_*` от
+/// канонического владельца формы и обращения `form_query` из ручных запросов
+/// динамических списков → `metadata_code_usages`. Полный пересбор своих строк
+/// (DELETE по видам + INSERT) — идемпотентно. Строго ПОСЛЕ `index_data_links`:
+/// та сносит все рёбра репо и пишет объектные.
+pub(crate) fn index_form_refs(repo_root: &Path, conn: &rusqlite::Connection) -> Result<()> {
+    let _ = conn.execute("ROLLBACK", []);
+    conn.execute("BEGIN", [])?;
+    delete_form_refs_all(conn)?;
+
+    let mut forms = 0usize;
+    let mut edges = 0usize;
+    let mut usages = 0usize;
+    for entry in WalkDir::new(repo_root)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+    {
+        let path = entry.path();
+        if path.file_name().and_then(|n| n.to_str()) != Some("Form.xml") {
+            continue;
+        }
+        let (owner_full, form_name) = match form_owner_canonical(repo_root, path) {
+            Some(t) => t,
+            None => continue,
+        };
+        let refs = match parse_form_refs_file(path) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!("parse_form_refs_file({}): {}", path.display(), e);
+                continue;
+            }
+        };
+        if refs.edges.is_empty() && refs.queries.is_empty() {
+            continue;
+        }
+        let rel = rel_path(repo_root, path);
+        let (e, u) = insert_form_refs(conn, &owner_full, &form_name, &rel, &refs)?;
+        forms += 1;
+        edges += e;
+        usages += u;
+    }
+    backfill_data_link_keys(conn)?;
+    conn.execute("COMMIT", [])?;
+
+    code_index_core::logging::stage_detail(code_index_core::logging::plural(
+        edges as u64,
+        "ребро",
+        "ребра",
+        "рёбер",
+    ));
+    tracing::info!(
+        "data_links(form-level): {} рёбер и {} обращений из запросов списков ({} форм)",
+        edges,
+        usages,
+        forms
+    );
+    Ok(())
+}
+
+/// Снести всё, что порождено формами: рёбра `form_*` и обращения `form_query`.
+pub(crate) fn delete_form_refs_all(conn: &rusqlite::Connection) -> Result<()> {
+    conn.execute(
+        "DELETE FROM data_links WHERE repo = ?1 \
+         AND link_kind IN ('form_attr', 'form_param', 'form_main_table')",
+        params![REPO_DEFAULT],
+    )?;
+    conn.execute(
+        "DELETE FROM metadata_code_usages WHERE repo = ?1 AND usage_kind = 'form_query'",
+        params![REPO_DEFAULT],
+    )?;
+    Ok(())
+}
+
+/// Записать ссылки одной формы. Рёбра — в `data_links` от канонического
+/// владельца с `from_path` = `Form.<Имя>.<путь>`; запросы динамических
+/// списков — в `metadata_code_usages` видом `form_query`, `file_path` — путь
+/// файла формы. Возвращает (рёбер, обращений). Транзакцию ведёт вызывающий,
+/// `to_object_key` дописывает он же (`backfill_data_link_keys`).
+pub(crate) fn insert_form_refs(
+    conn: &rusqlite::Connection,
+    owner_full: &str,
+    form_name: &str,
+    rel: &str,
+    refs: &FormRefs,
+) -> Result<(usize, usize)> {
+    let mut edges = 0usize;
+    if !refs.edges.is_empty() {
+        let mut stmt = conn.prepare(
+            "INSERT OR IGNORE INTO data_links \
+             (repo, from_object, from_path, to_object, link_kind, is_composite, is_universal) \
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )?;
+        for edge in &refs.edges {
+            let from_path = format!("Form.{}.{}", form_name, edge.from_path);
+            edges += stmt.execute(params![
+                REPO_DEFAULT,
+                owner_full,
+                &from_path,
+                &edge.to_object,
+                edge.link_kind,
+                edge.is_composite as i64,
+                edge.is_universal as i64,
+            ])?;
+        }
+    }
+    let mut usages = 0usize;
+    if !refs.queries.is_empty() {
+        let mut stmt = conn.prepare(
+            "INSERT INTO metadata_code_usages \
+             (repo, object_ref, object_ref_key, member_path, usage_kind, file_path, line) \
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )?;
+        for (line, text) in &refs.queries {
+            for u in extract_query_usages(text, *line, "form_query") {
+                stmt.execute(params![
+                    REPO_DEFAULT,
+                    &u.object_ref,
+                    &u.object_ref_key,
+                    &u.member_path,
+                    u.usage_kind,
+                    rel,
+                    u.line as i64,
+                ])?;
+                usages += 1;
+            }
+        }
+    }
+    Ok((edges, usages))
+}
+
+
+/// Запросы схем компоновки данных (XML-слой) → обращения `dcs_query` в
+/// `metadata_code_usages`. Содержимое макета лежит в
+/// `Templates/<Имя>/Ext/Template.xml` (у общих макетов — `CommonTemplates/`);
+/// какого оно рода, видно по корневому тегу, поэтому сначала читаются первые
+/// байты, и целиком читаются только схемы компоновки: макеты печатных форм
+/// бывают по десятки мегабайт. Полный пересбор своих строк — идемпотентно.
+pub(crate) fn index_dcs_query_usages(repo_root: &Path, conn: &rusqlite::Connection) -> Result<()> {
+    let _ = conn.execute("ROLLBACK", []);
+    conn.execute("BEGIN", [])?;
+    conn.execute(
+        "DELETE FROM metadata_code_usages WHERE repo = ?1 AND usage_kind = 'dcs_query'",
+        params![REPO_DEFAULT],
+    )?;
+
+    let mut schemas = 0usize;
+    let mut total = 0usize;
+    for entry in WalkDir::new(repo_root)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+    {
+        let path = entry.path();
+        if !is_template_content_path(path) {
+            continue;
+        }
+        let content = match read_dcs_content(path) {
+            Some(c) => c,
+            None => continue,
+        };
+        let queries = match parse_dcs_queries(&content) {
+            Ok(q) => q,
+            Err(e) => {
+                tracing::warn!("parse_dcs_queries({}): {}", path.display(), e);
+                continue;
+            }
+        };
+        if queries.is_empty() {
+            continue;
+        }
+        schemas += 1;
+        total += insert_dcs_usages(conn, &rel_path(repo_root, path), &queries)?;
+    }
+    conn.execute("COMMIT", [])?;
+
+    code_index_core::logging::stage_detail(code_index_core::logging::plural(
+        total as u64,
+        "обращение",
+        "обращения",
+        "обращений",
+    ));
+    tracing::info!(
+        "dcs_query_usages: {} обращений из {} схем компоновки",
+        total,
+        schemas
+    );
+    Ok(())
+}
+
+/// Содержимое макета — `Template.xml` внутри `Ext/` (описание макета лежит
+/// уровнем выше, в `Templates/<Имя>.xml`, и разбирается отдельно).
+pub(crate) fn is_template_content_path(path: &Path) -> bool {
+    path.file_name().and_then(|n| n.to_str()) == Some("Template.xml")
+        && path.parent().and_then(|d| d.file_name()).and_then(|s| s.to_str()) == Some("Ext")
+}
+
+/// Прочитать содержимое макета, если это схема компоновки; иначе `None`.
+/// Решение принимается по первым байтам, чтобы не читать целиком макеты
+/// табличных документов.
+pub(crate) fn read_dcs_content(path: &Path) -> Option<String> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut head = vec![0u8; 2048];
+    let n = f.read(&mut head).ok()?;
+    if !is_dcs_template(&String::from_utf8_lossy(&head[..n])) {
+        return None;
+    }
+    std::fs::read_to_string(path).ok()
+}
+
+/// Записать обращения из запросов одной схемы компоновки. Возвращает число
+/// строк. Транзакцию ведёт вызывающий.
+pub(crate) fn insert_dcs_usages(
+    conn: &rusqlite::Connection,
+    rel: &str,
+    queries: &[(usize, String)],
+) -> Result<usize> {
+    let mut stmt = conn.prepare(
+        "INSERT INTO metadata_code_usages \
+         (repo, object_ref, object_ref_key, member_path, usage_kind, file_path, line) \
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
+    )?;
+    let mut n = 0usize;
+    for (line, text) in queries {
+        for u in extract_query_usages(text, *line, "dcs_query") {
+            stmt.execute(params![
+                REPO_DEFAULT,
+                &u.object_ref,
+                &u.object_ref_key,
+                &u.member_path,
+                u.usage_kind,
+                rel,
+                u.line as i64,
+            ])?;
+            n += 1;
+        }
+    }
+    Ok(n)
 }

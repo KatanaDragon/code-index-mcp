@@ -7,7 +7,8 @@ use code_index_core::storage::Storage;
 use rusqlite::params;
 use crate::xml::config_dump_info::parse_config_dump_info_rows;
 use crate::xml::event_subscriptions::parse_event_subscription_file;
-use crate::xml::forms::parse_form_file;
+use crate::xml::dcs::parse_dcs_queries;
+use crate::xml::forms::{parse_form_file, parse_form_refs_file};
 use crate::code_usages::extract_code_usages;
 use crate::xml::object_attributes::{
     parse_object_attributes_file, parse_object_belonging, parse_object_header_xml,
@@ -347,6 +348,79 @@ pub(crate) fn update_event_subscription_for_file(conn: &rusqlite::Connection, xm
 }
 
 
+/// Per-file обновление ссылок формы: снести её прежние рёбра `form_*` (по
+/// префиксу `Form.<Имя>.` у канонического владельца) и обращения `form_query`
+/// этого файла, затем переразобрать Form.xml — либо только снести, если файл
+/// удалён.
+pub(crate) fn update_form_refs_for_file(
+    repo_root: &Path,
+    conn: &rusqlite::Connection,
+    form_xml_path: &Path,
+) -> Result<()> {
+    let (owner_full, form_name) = match form_owner_canonical(repo_root, form_xml_path) {
+        Some(t) => t,
+        None => return Ok(()),
+    };
+    let rel = rel_path(repo_root, form_xml_path);
+    let prefix = format!("Form.{}.", form_name);
+    let _ = conn.execute("ROLLBACK", []);
+    conn.execute("BEGIN", [])?;
+    conn.execute(
+        "DELETE FROM data_links WHERE repo = ?1 AND from_object = ?2 \
+         AND link_kind IN ('form_attr', 'form_param', 'form_main_table') \
+         AND substr(from_path, 1, length(?3)) = ?3",
+        params![REPO_DEFAULT, &owner_full, &prefix],
+    )?;
+    conn.execute(
+        "DELETE FROM metadata_code_usages WHERE repo = ?1 AND file_path = ?2 \
+         AND usage_kind = 'form_query'",
+        params![REPO_DEFAULT, &rel],
+    )?;
+    if form_xml_path.is_file() {
+        match parse_form_refs_file(form_xml_path) {
+            Ok(refs) => {
+                insert_form_refs(conn, &owner_full, &form_name, &rel, &refs)?;
+                backfill_data_link_keys(conn)?;
+            }
+            Err(e) => tracing::warn!("update_form_refs_for_file {}: {}", form_xml_path.display(), e),
+        }
+    }
+    conn.execute("COMMIT", [])?;
+    Ok(())
+}
+
+
+/// Per-file обновление обращений `dcs_query` по содержимому макета: снести
+/// строки файла и переразобрать, если это схема компоновки. Удалённый файл и
+/// макет другого рода оставляют файл без строк.
+pub(crate) fn update_dcs_usages_for_file(
+    repo_root: &Path,
+    conn: &rusqlite::Connection,
+    template_path: &Path,
+) -> Result<()> {
+    let rel = rel_path(repo_root, template_path);
+    let _ = conn.execute("ROLLBACK", []);
+    conn.execute("BEGIN", [])?;
+    conn.execute(
+        "DELETE FROM metadata_code_usages WHERE repo = ?1 AND file_path = ?2 \
+         AND usage_kind = 'dcs_query'",
+        params![REPO_DEFAULT, &rel],
+    )?;
+    if template_path.is_file() {
+        if let Some(content) = read_dcs_content(template_path) {
+            match parse_dcs_queries(&content) {
+                Ok(queries) => {
+                    insert_dcs_usages(conn, &rel, &queries)?;
+                }
+                Err(e) => tracing::warn!("update_dcs_usages_for_file {}: {}", template_path.display(), e),
+            }
+        }
+    }
+    conn.execute("COMMIT", [])?;
+    Ok(())
+}
+
+
 /// Инкрементально обновить extras для файлов одного watcher-батча.
 ///
 /// Маршрутизация по типу файла:
@@ -392,6 +466,9 @@ pub fn run_incremental_extras(
     let mut sub_xmls: Vec<&std::path::PathBuf> = Vec::new();
     // Описания макетов объектов (`<Объект>/Templates/<Имя>.xml`).
     let mut template_xmls: Vec<&std::path::PathBuf> = Vec::new();
+    // Содержимое макетов (`Templates/<Имя>/Ext/Template.xml`): интересны схемы
+    // компоновки — их запросы идут в обратный индекс использований.
+    let mut dcs_xmls: Vec<&std::path::PathBuf> = Vec::new();
     // Источники data_links конфиг-уровня / role_rights изменились в этом батче.
     // Они лежат вне OBJECT_FOLDERS и не привязаны к одному объекту → при
     // попадании дешевле полностью пересобрать соответствующую таблицу.
@@ -430,6 +507,8 @@ pub fn run_incremental_extras(
             }
         } else if fname == "Form.xml" {
             form_xmls.push(p);
+        } else if is_template_content_path(p) {
+            dcs_xmls.push(p);
         } else if ext == "xml"
             && p.parent().and_then(|d| d.file_name()).and_then(|s| s.to_str()) == Some("Templates")
         {
@@ -531,11 +610,19 @@ pub fn run_incremental_extras(
         let t = std::time::Instant::now();
         update_metadata_forms_for_file(repo_root, conn, p)?;
         code_index_core::logging::stage_add("формы", t.elapsed());
+        let t = std::time::Instant::now();
+        update_form_refs_for_file(repo_root, conn, p)?;
+        code_index_core::logging::stage_add("связи форм", t.elapsed());
     }
     for p in &template_xmls {
         let t = std::time::Instant::now();
         update_object_template_for_file(repo_root, conn, p)?;
         code_index_core::logging::stage_add("макеты", t.elapsed());
+    }
+    for p in &dcs_xmls {
+        let t = std::time::Instant::now();
+        update_dcs_usages_for_file(repo_root, conn, p)?;
+        code_index_core::logging::stage_add("запросы СКД", t.elapsed());
     }
     for p in &sub_xmls {
         let t = std::time::Instant::now();
@@ -547,6 +634,8 @@ pub fn run_incremental_extras(
         ("связи данных", object_xmls.len()),
         ("структура объектов", object_xmls.len()),
         ("формы", form_xmls.len()),
+        ("связи форм", form_xmls.len()),
+        ("запросы СКД", dcs_xmls.len()),
         ("подписки", sub_xmls.len()),
     ] {
         if сколько > 0 {

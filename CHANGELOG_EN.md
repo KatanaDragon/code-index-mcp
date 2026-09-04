@@ -5,6 +5,21 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [Unreleased]
+
+**An object's impact map now sees forms and data composition schemas: form attributes and parameters, dynamic lists and DCS queries no longer fall out of reference search.**
+
+### Added
+
+- **Form references in the data-links graph.** A form description references objects not only through handlers: a form attribute typed `CatalogRef.X`, a form parameter, a dynamic list whose main table is `Document.Y` — relations that live neither in the owner's object XML nor in a module, so `find_references` never showed them: a pick form of one document listing another was missing from the latter's impact map, and a rename broke the form silently. These are now `data_links` edges of kinds `form_attr` (type of a form attribute or of a column of a table attribute), `form_param` (type of a form parameter) and `form_main_table` (main table of a dynamic list), from the canonical form owner (`Document.X`; `CommonForm.X` for a common form) with `from_path` shaped `Form.<Name>.<Attribute>`. Object types of form attributes (`DocumentObject.X`, `InformationRegisterRecordSet.X`) are reduced to the object reference; `DynamicList` itself and value tables yield no edges. The edges show up in `find_references` (`data_refs` section) and `get_data_links` (incoming direction).
+- **Queries of data composition schemas and dynamic lists in the reverse usage index.** The query text of a DCS data set (`<query>` in `Templates/<Name>/Ext/Template.xml`, union sets included) and the manual query of a dynamic list (`<QueryText>` in `Form.xml`) address configuration tables just like a query in a module, but lived outside `.bsl` and never reached `metadata_code_usages`: a report reading a document was absent from the document's impact map. They are now usages of kinds `dcs_query` and `form_query` with the XML file path and the line within it (`find_references`, `code_usages` section). Template content is read in full only for composition schemas — the kind of a template is decided from its first bytes, so spreadsheet templates of tens of megabytes are never opened.
+- **Incremental path.** Editing a `Form.xml` rebuilds the edges and usages of that form only; editing or deleting a `Template.xml` rebuilds the usages of that schema only. The full rebuild of `.bsl` usages removes only its own kinds (`manager`/`ref_type`/`query`), leaving form and schema rows intact.
+
+### Verification
+
+- **Unit and integration tests:** `cargo test --workspace` — 830 passed, 0 failed (was 817). New tests cover parsing of form attribute, parameter, column and dynamic-list types, DCS queries with unions and line numbers, the full pass and the incremental path for forms and schemas, and incremental == full rebuild equality.
+- **Live check** on a dump of a complex configuration (125k files): form edges — 26,863 from 8,675 forms in 15.9 s (`form_attr` 22,372, `form_main_table` 3,493, `form_param` 998), dynamic-list query usages — 7,927; DCS queries — 25,024 usages from 1,048 schemas in 5.2 s. For a document whose impact map had been missing one report's DCS schema and two foreign forms, `find_references` now shows all three: `dcs_query` in the report template, `form_query` in another document's pick form, `form_attr` in a data processor form.
+
 ## [1.0.1] — 2026-08-28
 
 **A role-rights query no longer runs a spurious second branch, nor carries a hint about an object that was never asked for.**

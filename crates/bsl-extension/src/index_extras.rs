@@ -153,6 +153,13 @@ fn run_index_extras_metadata_layer(repo_root: &Path, conn: &rusqlite::Connection
     phase("связи конфигурации", "data_links(config-level)", || {
         index_metadata_refs(repo_root, conn)
     });
+    // Ссылки из описаний форм: типы реквизитов и параметров формы, основная
+    // таблица динамического списка — рёбра `form_*` поверх объектных; ручные
+    // запросы динамических списков — обращения `form_query`. Тоже строго
+    // ПОСЛЕ index_data_links, по той же причине.
+    phase("связи форм", "data_links(form-level)", || {
+        index_form_refs(repo_root, conn)
+    });
     // Права ролей → отдельная таблица role_rights.
     phase("права ролей", "role_rights", || {
         index_role_rights(repo_root, conn)
@@ -176,6 +183,11 @@ fn run_index_extras_metadata_layer(repo_root: &Path, conn: &rusqlite::Connection
     // синонимов (те делают UPDATE по перечню и макетов не касаются).
     phase("макеты", "object_templates", || {
         index_object_templates(repo_root, conn)
+    });
+    // Запросы схем компоновки данных → обращения `dcs_query`. Открывает
+    // содержимое макетов, но целиком читает только схемы (по первым байтам).
+    phase("запросы СКД", "dcs_query_usages", || {
+        index_dcs_query_usages(repo_root, conn)
     });
     phase("формы", "metadata_forms", || {
         index_metadata_forms(repo_root, conn)

@@ -3834,3 +3834,262 @@ fn edt_incremental_removes_deleted_object() {
         "модули удалённого объекта тоже убираются"
     );
 }
+
+
+/// Форма документа с реквизитом, динамическим списком (ручной запрос и
+/// основная таблица) и параметром; общая форма с объектным типом; отчёт со
+/// схемой компоновки и с макетом табличного документа рядом.
+fn write_form_refs_fixture(repo: &Path) {
+    write(
+        &repo.join("Configuration.xml"),
+        r#"<?xml version="1.0"?>
+<MetaDataObject><Configuration><ChildObjects>
+  <Document>Заказ</Document><Document>Реализация</Document><Report>Продажи</Report>
+</ChildObjects></Configuration></MetaDataObject>"#,
+    );
+    write(
+        &repo
+            .join("Documents")
+            .join("Заказ")
+            .join("Forms")
+            .join("ФормаВыбора")
+            .join("Ext")
+            .join("Form.xml"),
+        FORM_BEFORE,
+    );
+    write(
+        &repo.join("CommonForms").join("Подбор").join("Ext").join("Form.xml"),
+        r#"<Form xmlns:v8="http://v8.1c.ru/8.1/data/core"><Attributes><Attribute name="Объект"><Type><v8:Type>cfg:DocumentObject.Заказ</v8:Type></Type></Attribute></Attributes></Form>"#,
+    );
+    write(
+        &repo
+            .join("Reports")
+            .join("Продажи")
+            .join("Templates")
+            .join("Схема")
+            .join("Ext")
+            .join("Template.xml"),
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<DataCompositionSchema xmlns="http://v8.1c.ru/8.1/data-composition-system/schema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <dataSet xsi:type="DataSetQuery">
+    <query>ВЫБРАТЬ Т.Номенклатура
+ИЗ Документ.Реализация.Товары КАК Т</query>
+  </dataSet>
+</DataCompositionSchema>"#,
+    );
+    // Макет табличного документа: имя объекта в ячейке обращением не считается.
+    write(
+        &repo
+            .join("Reports")
+            .join("Продажи")
+            .join("Templates")
+            .join("Макет")
+            .join("Ext")
+            .join("Template.xml"),
+        r#"<?xml version="1.0"?>
+<Template xmlns="http://v8.1c.ru/8.2/data/spreadsheet"><Rows><Row><Cell>Документ.Реализация</Cell></Row></Rows></Template>"#,
+    );
+}
+
+const FORM_BEFORE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<Form xmlns:v8="http://v8.1c.ru/8.1/data/core" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <Attributes>
+    <Attribute name="Контрагент" id="1">
+      <Type><v8:Type>cfg:CatalogRef.Контрагенты</v8:Type></Type>
+    </Attribute>
+    <Attribute name="Список" id="2">
+      <Type><v8:Type>cfg:DynamicList</v8:Type></Type>
+      <Settings xsi:type="DynamicList">
+        <ManualQuery>true</ManualQuery>
+        <QueryText>ВЫБРАТЬ Р.Ссылка
+ИЗ Документ.Реализация КАК Р</QueryText>
+        <MainTable>Document.Реализация</MainTable>
+      </Settings>
+    </Attribute>
+  </Attributes>
+  <Parameters>
+    <Parameter name="Склад"><Type><v8:Type>cfg:CatalogRef.Склады</v8:Type></Type></Parameter>
+  </Parameters>
+</Form>"#;
+
+/// Та же форма после правки: реквизит сменил тип, список смотрит на другой
+/// документ, параметра больше нет.
+const FORM_AFTER: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<Form xmlns:v8="http://v8.1c.ru/8.1/data/core" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <Attributes>
+    <Attribute name="Контрагент" id="1">
+      <Type><v8:Type>cfg:CatalogRef.Организации</v8:Type></Type>
+    </Attribute>
+    <Attribute name="Список" id="2">
+      <Type><v8:Type>cfg:DynamicList</v8:Type></Type>
+      <Settings xsi:type="DynamicList">
+        <ManualQuery>true</ManualQuery>
+        <QueryText>ВЫБРАТЬ З.Ссылка ИЗ Документ.Заказ КАК З</QueryText>
+        <MainTable>Document.Заказ</MainTable>
+      </Settings>
+    </Attribute>
+  </Attributes>
+</Form>"#;
+
+fn form_edges(st: &Storage) -> Vec<(String, String, String, String)> {
+    let conn = st.conn();
+    let mut s = conn
+        .prepare(
+            "SELECT from_object, from_path, to_object, link_kind FROM data_links \
+             WHERE link_kind IN ('form_attr', 'form_param', 'form_main_table') \
+             ORDER BY from_object, from_path, to_object",
+        )
+        .unwrap();
+    s.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+        .unwrap()
+        .map(|x| x.unwrap())
+        .collect()
+}
+
+fn query_usages(st: &Storage) -> Vec<(String, Option<String>, String, String, i64)> {
+    let conn = st.conn();
+    let mut s = conn
+        .prepare(
+            "SELECT object_ref, member_path, usage_kind, file_path, line FROM metadata_code_usages \
+             WHERE usage_kind IN ('form_query', 'dcs_query') ORDER BY file_path, line, object_ref",
+        )
+        .unwrap();
+    s.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
+        .unwrap()
+        .map(|x| x.unwrap())
+        .collect()
+}
+
+/// Ссылки форм: типы реквизитов и параметров, основная таблица и запрос
+/// динамического списка становятся рёбрами `form_*` от канонического
+/// владельца и обращениями `form_query`; запросы схем компоновки —
+/// обращениями `dcs_query`. Макет табличного документа схемой не считается.
+#[test]
+fn fills_form_refs_and_dcs_query_usages() {
+    let tmp = TempDir::new().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    write_form_refs_fixture(&repo);
+
+    let mut storage = fresh_storage(&tmp);
+    run_index_extras(&repo, &mut storage).unwrap();
+
+    let edges = form_edges(&storage);
+    let has = |e: (&str, &str, &str, &str)| {
+        edges.contains(&(e.0.to_string(), e.1.to_string(), e.2.to_string(), e.3.to_string()))
+    };
+    assert!(has(("Document.Заказ", "Form.ФормаВыбора.Контрагент", "Catalog.Контрагенты", "form_attr")), "{edges:?}");
+    assert!(has(("Document.Заказ", "Form.ФормаВыбора.Список", "Document.Реализация", "form_main_table")), "{edges:?}");
+    assert!(has(("Document.Заказ", "Form.ФормаВыбора.Склад", "Catalog.Склады", "form_param")), "{edges:?}");
+    // Общая форма — владелец `CommonForm.<Имя>`, имя формы равно имени объекта,
+    // объектный тип приведён к ссылке.
+    assert!(has(("CommonForm.Подбор", "Form.Подбор.Объект", "Document.Заказ", "form_attr")), "{edges:?}");
+    // Сам динамический список ребром не является.
+    assert!(!edges.iter().any(|e| e.2.contains("DynamicList")));
+    // Ключ реверс-поиска заполнен (find_references ищет по to_object_key).
+    let unkeyed: i64 = storage
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM data_links \
+             WHERE link_kind IN ('form_attr', 'form_param', 'form_main_table') AND to_object_key = ''",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(unkeyed, 0);
+
+    let usages = query_usages(&storage);
+    assert!(
+        usages.contains(&(
+            "Document.Реализация".to_string(),
+            None,
+            "form_query".to_string(),
+            "Documents/Заказ/Forms/ФормаВыбора/Ext/Form.xml".to_string(),
+            12,
+        )),
+        "{usages:?}"
+    );
+    assert!(
+        usages.contains(&(
+            "Document.Реализация".to_string(),
+            Some("Товары".to_string()),
+            "dcs_query".to_string(),
+            "Reports/Продажи/Templates/Схема/Ext/Template.xml".to_string(),
+            5,
+        )),
+        "{usages:?}"
+    );
+    // Табличный документ обращений не даёт.
+    assert!(!usages.iter().any(|u| u.3.contains("Макет")));
+
+    // Идемпотентность: повторный полный проход не плодит дублей.
+    run_index_extras(&repo, &mut storage).unwrap();
+    assert_eq!(form_edges(&storage), edges);
+    assert_eq!(query_usages(&storage), usages);
+}
+
+/// Инкремент: правка формы заменяет её рёбра и обращения, не задевая другие
+/// формы; удаление схемы компоновки убирает её обращения. Итог совпадает с
+/// полным пересбором.
+#[test]
+fn incremental_form_refs_and_dcs_usages_follow_file_changes() {
+    let tmp = TempDir::new().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    write_form_refs_fixture(&repo);
+    let mut storage = fresh_storage(&tmp);
+    run_index_extras(&repo, &mut storage).unwrap();
+
+    let form = repo
+        .join("Documents")
+        .join("Заказ")
+        .join("Forms")
+        .join("ФормаВыбора")
+        .join("Ext")
+        .join("Form.xml");
+    write(&form, FORM_AFTER);
+    run_incremental_extras(&repo, &mut storage, &[form.clone()], &[]).unwrap();
+
+    let edges = form_edges(&storage);
+    let of_form: Vec<_> = edges.iter().filter(|e| e.1.starts_with("Form.ФормаВыбора.")).collect();
+    assert_eq!(of_form.len(), 2, "реквизит + список, параметра больше нет: {edges:?}");
+    assert!(edges.contains(&(
+        "Document.Заказ".to_string(),
+        "Form.ФормаВыбора.Контрагент".to_string(),
+        "Catalog.Организации".to_string(),
+        "form_attr".to_string(),
+    )));
+    assert!(edges.contains(&(
+        "Document.Заказ".to_string(),
+        "Form.ФормаВыбора.Список".to_string(),
+        "Document.Заказ".to_string(),
+        "form_main_table".to_string(),
+    )));
+    assert!(!edges.iter().any(|e| e.2 == "Catalog.Контрагенты" || e.2 == "Catalog.Склады"));
+    // Общая форма не тронута.
+    assert!(edges.iter().any(|e| e.0 == "CommonForm.Подбор"));
+    let usages = query_usages(&storage);
+    assert!(usages.iter().any(|u| u.2 == "form_query" && u.0 == "Document.Заказ" && u.4 == 11));
+    assert!(!usages.iter().any(|u| u.2 == "form_query" && u.0 == "Document.Реализация"));
+    // Схема компоновки пока на месте.
+    assert!(usages.iter().any(|u| u.2 == "dcs_query"));
+
+    // Удаление схемы компоновки — её обращения уходят.
+    let dcs = repo
+        .join("Reports")
+        .join("Продажи")
+        .join("Templates")
+        .join("Схема")
+        .join("Ext")
+        .join("Template.xml");
+    std::fs::remove_file(&dcs).unwrap();
+    run_incremental_extras(&repo, &mut storage, &[], &[dcs]).unwrap();
+    assert!(!query_usages(&storage).iter().any(|u| u.2 == "dcs_query"));
+
+    // Инкремент == полный пересбор.
+    let inc_edges = form_edges(&storage);
+    let inc_usages = query_usages(&storage);
+    run_index_extras(&repo, &mut storage).unwrap();
+    assert_eq!(form_edges(&storage), inc_edges);
+    assert_eq!(query_usages(&storage), inc_usages);
+}

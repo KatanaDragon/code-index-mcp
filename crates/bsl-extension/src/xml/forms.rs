@@ -293,6 +293,409 @@ fn local_name(name: &[u8]) -> String {
     }
 }
 
+// ── Ссылки формы на объекты конфигурации ─────────────────────────────────
+//
+// Описание формы ссылается на объекты не только обработчиками. Реквизит формы
+// типа `СправочникСсылка.Контрагенты`, параметр формы, динамический список с
+// основной таблицей `Документ.Заказ` и его ручной запрос — всё это связи,
+// которых нет ни в XML объекта-владельца, ни в модуле. Форма подбора одного
+// документа, показывающая список другого, до этого в карте влияния второго
+// не значилась: переименование ломало форму молча.
+//
+// Разбор мягкий, по локальным именам тегов, как у обработчиков выше:
+//
+//   <Attributes>
+//     <Attribute name="Контрагент"><Type><v8:Type>cfg:CatalogRef.Контрагенты</v8:Type></Type>
+//     <Attribute name="Список"><Type><v8:Type>cfg:DynamicList</v8:Type></Type>
+//       <Settings xsi:type="DynamicList">
+//         <QueryText>ВЫБРАТЬ … ИЗ Документ.Заказ КАК З</QueryText>
+//         <MainTable>Document.Заказ</MainTable>
+//     <Attribute name="Таблица"><Columns><Column name="Склад"><Type>…
+//   <Parameters>
+//     <Parameter name="Склад"><Type><v8:Type>cfg:CatalogRef.Склады</v8:Type></Type>
+
+use super::object_attributes::{edges_from_types, DataLinkEdge};
+
+/// Ссылки описания формы на объекты конфигурации.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct FormRefs {
+    /// Рёбра от владельца формы к объектам. `from_path` — имя реквизита или
+    /// параметра формы (у колонки реквизита-таблицы — `Реквизит.Колонка`),
+    /// без имени формы: префикс `Form.<Имя>.` добавляет вызывающий, который
+    /// знает имя формы по пути файла.
+    pub edges: Vec<DataLinkEdge>,
+    /// Тексты запросов динамических списков с ручным запросом: номер строки
+    /// файла, на которой открылся тег `<QueryText>` (1-based), и текст как в
+    /// файле — вместе с ведущими переводами строк, чтобы номера строк внутри
+    /// текста считались от той же точки.
+    pub queries: Vec<(usize, String)>,
+}
+
+/// Виды рёбер `data_links`, порождаемых формами. Полный пересбор и
+/// пофайловое обновление сносят строки только этих видов.
+pub const FORM_LINK_KINDS: &[&str] = &["form_attr", "form_param", "form_main_table"];
+
+/// Тип реквизита формы → тип, понятный `classify_type`.
+///
+/// У реквизитов объектов в XML стоят только ссылки (`cfg:CatalogRef.X`), у
+/// реквизитов форм — ещё и объектные типы: основной реквизит формы документа
+/// имеет тип `cfg:DocumentObject.X`, форма набора записей —
+/// `cfg:InformationRegisterRecordSet.X`. Для графа данных это та же связь с
+/// объектом, поэтому суффикс приводится к `Ref`. Типы без имени объекта
+/// (`cfg:DynamicList`, `cfg:ValueTable`) не трогаем — `classify_type` их
+/// отбросит сам.
+fn form_type_to_ref(t: &str) -> String {
+    // Длинные суффиксы раньше коротких: `RecordSet` не должен пройти как `Record`.
+    const SUFFIXES: &[&str] = &[
+        "RecordSet", "RecordManager", "RecordKey", "Record", "Object", "Manager", "List", "Selection",
+    ];
+    let trimmed = t.trim();
+    if let Some(rest) = trimmed.strip_prefix("cfg:") {
+        if let Some((head, name)) = rest.split_once('.') {
+            for s in SUFFIXES {
+                if let Some(kind) = head.strip_suffix(s) {
+                    if !kind.is_empty() {
+                        return format!("cfg:{}Ref.{}", kind, name);
+                    }
+                }
+            }
+        }
+    }
+    trimmed.to_string()
+}
+
+/// Накопитель типов одного реквизита/параметра/колонки формы.
+struct FieldAcc {
+    from_path: String,
+    kind: &'static str,
+    types: Vec<String>,
+}
+
+/// Номер строки (1-based), на которой лежит байтовая позиция `pos`.
+fn line_at(content: &str, pos: usize) -> usize {
+    let end = pos.min(content.len());
+    content.as_bytes()[..end].iter().filter(|&&b| b == b'\n').count() + 1
+}
+
+/// Значение атрибута `name` открывающего тега, если есть.
+fn attr_name(e: &quick_xml::events::BytesStart<'_>) -> Option<String> {
+    for attr in e.attributes().with_checks(false).flatten() {
+        if local_name(attr.key.as_ref()) == "name" {
+            return Some(attr.unescape_value().map(|s| s.into_owned()).unwrap_or_default());
+        }
+    }
+    None
+}
+
+/// Открытый тег: локальное имя, атрибут `name`, заведён ли на него накопитель.
+type OpenTag = (String, Option<String>, bool);
+
+fn parent_is(stack: &[OpenTag], local: &str) -> bool {
+    stack.last().map(|(l, _, _)| l == local).unwrap_or(false)
+}
+
+/// Имя ближайшего открытого тега `local` с непустым атрибутом `name`.
+fn nearest_named(stack: &[OpenTag], local: &str) -> Option<String> {
+    stack
+        .iter()
+        .rev()
+        .find(|(l, n, _)| l == local && n.as_deref().map(|s| !s.is_empty()).unwrap_or(false))
+        .and_then(|(_, n, _)| n.clone())
+}
+
+fn inside(stack: &[OpenTag], local: &str) -> bool {
+    stack.iter().any(|(l, _, _)| l == local)
+}
+
+/// Текст лежит прямо в `<Type>`/`<v8:Type>` накопителя: между ним и текстом —
+/// только теги `Type`. Иначе это чужой `<Type>` (например, поле внутри
+/// настроек динамического списка), и в тип реквизита он не идёт.
+fn type_belongs_to_field(stack: &[OpenTag]) -> bool {
+    let mut saw_type = false;
+    for (l, _, has_acc) in stack.iter().rev() {
+        if l == "Type" {
+            saw_type = true;
+            continue;
+        }
+        return saw_type && *has_acc;
+    }
+    false
+}
+
+/// Распарсить XML формы: рёбра к объектам и тексты запросов динамических списков.
+pub fn parse_form_refs_xml(content: &str) -> Result<FormRefs> {
+    let mut reader = Reader::from_str(content);
+    // Без обрезки пробелов: текст запроса берём как в файле, чтобы номера строк
+    // внутри него отсчитывались от строки открывающего тега.
+    reader.config_mut().trim_text(false);
+
+    let mut out = FormRefs::default();
+    let mut buf = Vec::new();
+    let mut stack: Vec<OpenTag> = Vec::new();
+    let mut fields: Vec<FieldAcc> = Vec::new();
+    // Строка открывающего тега текущего `<QueryText>` (None — не внутри него).
+    let mut query_line: Option<usize> = None;
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => {
+                let local = local_name(e.name().as_ref());
+                let name_attr = attr_name(&e);
+                let mut has_acc = false;
+                match local.as_str() {
+                    "Attribute" | "Parameter" | "Column" => {
+                        let named = name_attr.as_deref().filter(|n| !n.is_empty());
+                        // Реквизит и параметр — только на своём уровне, колонка —
+                        // внутри реквизита-таблицы. Вложенные одноимённые теги
+                        // в настройках списков накопителя не заводят.
+                        let acc = match (local.as_str(), named) {
+                            ("Attribute", Some(n)) if parent_is(&stack, "Attributes") => {
+                                Some((n.to_string(), "form_attr"))
+                            }
+                            ("Parameter", Some(n)) if parent_is(&stack, "Parameters") => {
+                                Some((n.to_string(), "form_param"))
+                            }
+                            ("Column", Some(n)) if parent_is(&stack, "Columns") => {
+                                nearest_named(&stack, "Attribute")
+                                    .map(|a| (format!("{}.{}", a, n), "form_attr"))
+                            }
+                            _ => None,
+                        };
+                        if let Some((from_path, kind)) = acc {
+                            fields.push(FieldAcc { from_path, kind, types: Vec::new() });
+                            has_acc = true;
+                        }
+                    }
+                    "QueryText" if inside(&stack, "Settings") => {
+                        query_line = Some(line_at(content, reader.buffer_position() as usize));
+                    }
+                    _ => {}
+                }
+                stack.push((local, name_attr, has_acc));
+            }
+            Ok(Event::End(_)) => {
+                if let Some((local, _, has_acc)) = stack.pop() {
+                    if has_acc {
+                        if let Some(f) = fields.pop() {
+                            out.edges.extend(edges_from_types(f.from_path, &f.types, f.kind));
+                        }
+                    }
+                    if local == "QueryText" {
+                        query_line = None;
+                    }
+                }
+            }
+            Ok(Event::Text(t)) => {
+                let text = t.unescape().map(|s| s.into_owned()).unwrap_or_default();
+                collect_text(&stack, &mut fields, &mut out, query_line, &text);
+            }
+            Ok(Event::CData(c)) => {
+                let text = String::from_utf8_lossy(c.into_inner().as_ref()).into_owned();
+                collect_text(&stack, &mut fields, &mut out, query_line, &text);
+            }
+            Ok(Event::Eof) => break,
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "Form XML: ошибка парсинга ссылок на позиции {}: {}",
+                    reader.buffer_position(),
+                    e
+                ));
+            }
+            _ => {}
+        }
+        buf.clear();
+    }
+    Ok(out)
+}
+
+/// Разложить текстовый узел по назначению: тип реквизита, основная таблица
+/// динамического списка либо кусок текста его запроса.
+fn collect_text(
+    stack: &[OpenTag],
+    fields: &mut [FieldAcc],
+    out: &mut FormRefs,
+    query_line: Option<usize>,
+    text: &str,
+) {
+    let top = match stack.last() {
+        Some((l, _, _)) => l.as_str(),
+        None => return,
+    };
+    match top {
+        "Type" => {
+            if type_belongs_to_field(stack) {
+                if let Some(f) = fields.last_mut() {
+                    let t = text.trim();
+                    if !t.is_empty() {
+                        f.types.push(form_type_to_ref(t));
+                    }
+                }
+            }
+        }
+        "MainTable" if inside(stack, "Settings") => {
+            let to_object = crate::code_usages::normalize_object_ref(text.trim()).into_owned();
+            if let Some(attr) = nearest_named(stack, "Attribute") {
+                if to_object.contains('.') {
+                    out.edges.push(DataLinkEdge {
+                        from_path: attr,
+                        to_object,
+                        link_kind: "form_main_table",
+                        is_composite: false,
+                        is_universal: false,
+                    });
+                }
+            }
+        }
+        "QueryText" => {
+            if let Some(line) = query_line {
+                // Текст может прийти несколькими узлами (сущности, CDATA) —
+                // склеиваем в один запрос той же строки.
+                match out.queries.last_mut() {
+                    Some((l, q)) if *l == line => q.push_str(text),
+                    _ => out.queries.push((line, text.to_string())),
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Прочитать ссылки формы по пути. Файла нет — пустой результат.
+pub fn parse_form_refs_file(path: &Path) -> Result<FormRefs> {
+    if !path.is_file() {
+        return Ok(FormRefs::default());
+    }
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("Не удалось прочитать {}", path.display()))?;
+    parse_form_refs_xml(&content)
+}
+
+#[cfg(test)]
+mod refs_tests {
+    use super::*;
+
+    const FORM: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<Form xmlns="http://v8.1c.ru/8.3/xcf/logform" xmlns:v8="http://v8.1c.ru/8.1/data/core" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <Attributes>
+    <Attribute name="Объект" id="1">
+      <Type><v8:Type>cfg:DocumentObject.Заказ</v8:Type></Type>
+      <MainAttribute>true</MainAttribute>
+    </Attribute>
+    <Attribute name="Контрагент" id="2">
+      <Type>
+        <v8:Type>cfg:CatalogRef.Контрагенты</v8:Type>
+        <v8:Type>cfg:CatalogRef.Организации</v8:Type>
+      </Type>
+    </Attribute>
+    <Attribute name="Список" id="3">
+      <Type><v8:Type>cfg:DynamicList</v8:Type></Type>
+      <Settings xsi:type="DynamicList">
+        <ManualQuery>true</ManualQuery>
+        <QueryText>ВЫБРАТЬ
+	Р.Ссылка КАК Ссылка
+ИЗ
+	Документ.Реализация КАК Р
+	ЛЕВОЕ СОЕДИНЕНИЕ Справочник.Склады КАК С
+	ПО Истина</QueryText>
+        <Fields><Field><Type><v8:Type>cfg:CatalogRef.Пользователи</v8:Type></Type></Field></Fields>
+        <MainTable>Document.Реализация</MainTable>
+      </Settings>
+    </Attribute>
+    <Attribute name="Таблица" id="4">
+      <Type><v8:Type>cfg:ValueTable</v8:Type></Type>
+      <Columns>
+        <Column name="Склад" id="5">
+          <Type><v8:Type>cfg:CatalogRef.Склады</v8:Type></Type>
+        </Column>
+        <Column name="Сумма" id="6">
+          <Type><v8:Type>xs:decimal</v8:Type></Type>
+        </Column>
+      </Columns>
+    </Attribute>
+  </Attributes>
+  <Parameters>
+    <Parameter name="Склад">
+      <Type><v8:Type>cfg:CatalogRef.Склады</v8:Type></Type>
+    </Parameter>
+    <Parameter name="Флаг">
+      <Type><v8:Type>xs:boolean</v8:Type></Type>
+    </Parameter>
+  </Parameters>
+</Form>
+"#;
+
+    fn edge_tuples(r: &FormRefs) -> Vec<(String, String, &'static str, bool)> {
+        r.edges
+            .iter()
+            .map(|e| (e.from_path.clone(), e.to_object.clone(), e.link_kind, e.is_composite))
+            .collect()
+    }
+
+    #[test]
+    fn form_attribute_types_become_edges() {
+        let r = parse_form_refs_xml(FORM).unwrap();
+        let edges = edge_tuples(&r);
+        // Объектный тип основного реквизита приведён к ссылке.
+        assert!(edges.contains(&("Объект".into(), "Document.Заказ".into(), "form_attr", false)), "{edges:?}");
+        // Составной тип — два ребра с признаком составного.
+        assert!(edges.contains(&("Контрагент".into(), "Catalog.Контрагенты".into(), "form_attr", true)));
+        assert!(edges.contains(&("Контрагент".into(), "Catalog.Организации".into(), "form_attr", true)));
+        // Колонка таблицы — путь `Реквизит.Колонка`; примитивная колонка ребра не даёт.
+        assert!(edges.contains(&("Таблица.Склад".into(), "Catalog.Склады".into(), "form_attr", false)));
+        assert!(!edges.iter().any(|(p, _, _, _)| p == "Таблица.Сумма"));
+        // Параметр формы.
+        assert!(edges.contains(&("Склад".into(), "Catalog.Склады".into(), "form_param", false)));
+        assert!(!edges.iter().any(|(p, _, _, _)| p == "Флаг"));
+    }
+
+    #[test]
+    fn dynamic_list_main_table_and_query() {
+        let r = parse_form_refs_xml(FORM).unwrap();
+        let edges = edge_tuples(&r);
+        assert!(edges.contains(&("Список".into(), "Document.Реализация".into(), "form_main_table", false)), "{edges:?}");
+        // `<Type>` поля внутри настроек списка типом реквизита не считается.
+        assert!(!edges.iter().any(|(_, t, _, _)| t == "Catalog.Пользователи"));
+        // Сам DynamicList — не ссылка на объект.
+        assert!(!edges.iter().any(|(_, t, _, _)| t.contains("DynamicList")));
+
+        assert_eq!(r.queries.len(), 1);
+        let (line, text) = &r.queries[0];
+        assert_eq!(*line, 18, "строка открывающего тега <QueryText>");
+        assert!(text.starts_with("ВЫБРАТЬ"));
+        assert!(text.contains("Справочник.Склады"));
+        // Обращения из текста: путь на 4-й строке текста → 21-я строка файла.
+        let usages = crate::code_usages::extract_query_usages(text, *line, "form_query");
+        let real = usages.iter().find(|u| u.object_ref == "Document.Реализация").unwrap();
+        assert_eq!(real.line, 21);
+    }
+
+    #[test]
+    fn form_type_suffixes_normalized() {
+        assert_eq!(form_type_to_ref("cfg:DocumentObject.Заказ"), "cfg:DocumentRef.Заказ");
+        assert_eq!(
+            form_type_to_ref("cfg:InformationRegisterRecordSet.Курсы"),
+            "cfg:InformationRegisterRef.Курсы"
+        );
+        assert_eq!(form_type_to_ref("cfg:CatalogRef.Склады"), "cfg:CatalogRef.Склады");
+        assert_eq!(form_type_to_ref("cfg:DynamicList"), "cfg:DynamicList");
+        assert_eq!(form_type_to_ref("xs:string"), "xs:string");
+    }
+
+    #[test]
+    fn form_without_refs_is_empty() {
+        let r = parse_form_refs_xml(
+            "<Form><Events><Event name=\"OnOpen\">ПриОткрытии</Event></Events></Form>",
+        )
+        .unwrap();
+        assert!(r.edges.is_empty());
+        assert!(r.queries.is_empty());
+        assert!(parse_form_refs_file(std::path::Path::new("/non/existent.xml"))
+            .unwrap()
+            .edges
+            .is_empty());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

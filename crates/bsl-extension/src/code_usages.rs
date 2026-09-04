@@ -374,6 +374,79 @@ pub fn extract_code_usages(content: &str) -> Vec<CodeUsage> {
     out
 }
 
+/// Извлечь обращения к объектам метаданных из ГОЛОГО текста запроса — без
+/// кавычек и кода вокруг. Источники: `<query>` схемы компоновки данных в
+/// `Template.xml`, `<QueryText>` динамического списка в `Form.xml`. Разбор тот
+/// же, что у строковых литералов `.bsl` (пути метаданных `Документ.X[.ТЧ]` и
+/// тип-ссылки), но вид обращения задаёт вызывающий (`dcs_query` /
+/// `form_query`): по нему в ответе видно, что упоминание лежит не в модуле.
+/// `base_line` — номер строки файла, на которой начинается текст (1-based);
+/// строки текста нумеруются от него, поэтому текст передаётся как в файле,
+/// вместе с ведущими переводами строк.
+pub fn extract_query_usages(text: &str, base_line: usize, kind: &'static str) -> Vec<CodeUsage> {
+    let mut out: Vec<CodeUsage> = Vec::new();
+    for (idx, raw) in text.split('\n').enumerate() {
+        let raw = raw.strip_suffix('\r').unwrap_or(raw);
+        if !raw.contains('.') {
+            continue;
+        }
+        let lineno = base_line + idx;
+        for (g1, g2, g3) in path_triples(raw) {
+            let low = g1.to_lowercase();
+            if let Some(&canon) = ru_reftype_map().get(&low) {
+                out.push(make_usage(canon, &g2, None, kind, lineno));
+                continue;
+            }
+            if let Some(&canon) = query_map().get(&low) {
+                out.push(make_usage(canon, &g2, g3, kind, lineno));
+                continue;
+            }
+            if let Some(&canon) = en_reftype_map().get(&low) {
+                out.push(make_usage(canon, &g2, None, kind, lineno));
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod query_text_tests {
+    use super::*;
+
+    #[test]
+    fn query_text_paths_with_base_line() {
+        // Текст начинается на 10-й строке файла и с перевода строки (как
+        // `<query>\n…` в СКД): путь на третьей физической строке → 12.
+        let text = "\nВЫБРАТЬ Т.Ссылка\nИЗ Документ.Реализация.Товары КАК Т\n\tЛЕВОЕ СОЕДИНЕНИЕ Справочник.Номенклатура КАК Н";
+        let r = extract_query_usages(text, 10, "dcs_query");
+        assert_eq!(r.len(), 2);
+        assert_eq!(r[0].object_ref, "Document.Реализация");
+        assert_eq!(r[0].member_path.as_deref(), Some("Товары"));
+        assert_eq!(r[0].usage_kind, "dcs_query");
+        assert_eq!(r[0].line, 12);
+        assert_eq!(r[1].object_ref, "Catalog.Номенклатура");
+        assert_eq!(r[1].line, 13);
+    }
+
+    #[test]
+    fn query_text_ref_type_and_english() {
+        let r = extract_query_usages(
+            "ГДЕ ТИП(Т.Ссылка) = ТИП(СправочникСсылка.Контрагенты)\nFROM Document.Заказ AS З",
+            1,
+            "form_query",
+        );
+        assert_eq!(r[0].object_ref, "Catalog.Контрагенты");
+        assert_eq!(r[0].member_path, None);
+        assert_eq!(r[1].object_ref, "Document.Заказ");
+        assert_eq!(r[1].line, 2);
+    }
+
+    #[test]
+    fn query_text_without_paths_is_empty() {
+        assert!(extract_query_usages("ВЫБРАТЬ 1 КАК Поле", 1, "dcs_query").is_empty());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
