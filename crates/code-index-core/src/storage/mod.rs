@@ -377,6 +377,20 @@ impl Storage {
         r.ok().flatten()
     }
 
+    /// Есть ли в индексе хотя бы один файл с таким языком (дёшево: индекс по language
+    /// не нужен, достаточно первой строки). Нужен инструментам, чтобы решать по
+    /// содержимому индекса, а не по языку записи репо, который в некоторых режимах
+    /// запуска `serve` не заполнен.
+    pub fn has_language(&self, language: &str) -> bool {
+        self.conn
+            .query_row(
+                "SELECT 1 FROM files WHERE language = ?1 LIMIT 1",
+                params![language],
+                |_| Ok(()),
+            )
+            .is_ok()
+    }
+
     /// Получить запись файла по пути
     pub fn get_file_by_path(&self, path: &str) -> Result<Option<FileRecord>> {
         let mut stmt = self.conn.prepare(
