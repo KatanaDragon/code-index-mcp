@@ -22,6 +22,8 @@ on:
 
 jobs:
   publish:
+    # Сборки контура 1С (теги v*-ka.*) в реестр MCP не публикуются.
+    if: ${{ !contains(github.ref_name, '-ka.') }}
     runs-on: ubuntu-latest
 
     permissions:

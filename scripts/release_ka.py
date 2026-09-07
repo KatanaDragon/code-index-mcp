@@ -1,5 +1,7 @@
 # -*- coding: utf-8 -*-
-"""Выпуск сборки bsl-indexer для контура агента 1С: тесты -> cargo build --release -> тег v<база>-ka.N -> GitHub Release.
+"""Выпуск сборки bsl-indexer для контура агента 1С: тесты -> тег v<база>-ka.N -> push -> GitHub Actions
+(.github/workflows/release-ka.yml, windows-latest) собирает и публикует pre-release; скрипт ждет прогон.
+--local — прежний путь: cargo build --release и релиз с этой машины.
 
 Сборочная ветка build/ka-combined объединяет PR-ветки (формы/СКД, scope у грепов) поверх релиза автора.
 Версия сборки — версия из Cargo.toml плюс суффикс `-ka.<N>` (SemVer pre-release), чтобы не занимать
@@ -7,7 +9,8 @@
 (remote по умолчанию `ka`), не в репозиторий автора (origin).
 
 Использование:
-    python scripts/release_ka.py                 # следующий N по существующим тегам, тесты, сборка, релиз
+    python scripts/release_ka.py                 # следующий N по тегам, тесты, тег, push, ожидание Actions
+    python scripts/release_ka.py --local         # сборка и публикация с этой машины (без Actions)
     python scripts/release_ka.py --build 1       # явный номер сборки
     python scripts/release_ka.py --dry-run       # без тега и публикации
     python scripts/release_ka.py --remote ka --skip-tests
@@ -61,12 +64,56 @@ def next_build(base: str) -> int:
     return max(nums, default=0) + 1
 
 
+def выпуск_через_actions(a, branch: str, version: str, tag: str) -> int:
+    """Тег на HEAD, push в свой форк, ожидание workflow «Release KA build», ассеты релиза."""
+    if a.dry_run:
+        print("dry-run: тег и push не делаются; сборку и pre-release сделал бы GitHub Actions по тегу", tag)
+        return 0
+    gh = find_gh()
+    code, url = run(["git", "remote", "get-url", a.remote])
+    if code != 0 or "github.com" not in url:
+        print(f"Нет remote «{a.remote}» на GitHub: git remote add {a.remote} https://github.com/<владелец>/code-index-mcp.git")
+        return 2
+    repo = re.sub(r"^.*github\.com[:/]", "", url.strip()).removesuffix(".git")
+    _, existing = run(["git", "tag", "-l", tag])
+    if existing.strip():
+        print(f"Тег {tag} уже есть — укажите --build с другим номером")
+        return 2
+    run(["git", "tag", "-a", tag, "-m", f"bsl-indexer {version} (сборка контура 1С)"])
+    code, out = run(["git", "push", a.remote, "HEAD", tag])
+    if code != 0:
+        print(out[-2000:])
+        return 1
+    print(f"push выполнен; GitHub Actions ({repo}) собирает bsl-indexer: тесты и release-сборка на windows-latest, 15-30 мин…")
+    run_id = ""
+    for _ in range(12):
+        code, out = run([gh, "run", "list", "--repo", repo, "--workflow", "Release KA build", "--branch", tag,
+                         "--limit", "1", "--json", "databaseId", "--jq", ".[0].databaseId"])
+        run_id = out.strip()
+        if run_id.isdigit():
+            break
+        subprocess.run([sys.executable, "-c", "import time; time.sleep(5)"])
+    if not run_id.isdigit():
+        print("Прогон не найден за минуту — проверьте вкладку Actions форка (включены ли workflows)")
+        return 1
+    code, out = run([gh, "run", "watch", run_id, "--repo", repo, "--exit-status", "--interval", "20"])
+    print(out.strip()[-1500:])
+    if code != 0:
+        print(f"Прогон {run_id} упал: gh run view {run_id} --repo {repo} --log-failed")
+        return 1
+    code, out = run([gh, "release", "view", tag, "--repo", repo, "--json", "url,assets", "--jq",
+                     '.url, (.assets[] | .name + " " + (.size|tostring) + " байт")'])
+    print(out.strip())
+    return 0 if code == 0 else 1
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--build", type=int)
     ap.add_argument("--remote", default="ka", help="remote своего форка на GitHub (не origin автора)")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--skip-tests", action="store_true")
+    ap.add_argument("--local", action="store_true", help="собрать и опубликовать с этой машины, не ждать Actions")
     a = ap.parse_args()
 
     _, out = run(["git", "status", "--porcelain"])
@@ -90,6 +137,9 @@ def main() -> int:
         if code != 0 or failed:
             print(out[-3000:])
             return 1
+
+    if not a.local:
+        return выпуск_через_actions(a, branch.strip(), version, tag)
 
     print("cargo build --release -p bsl-indexer --features enrichment …")
     code, out = run(["cargo", "build", "--release", "-p", "bsl-indexer", "--features", "enrichment"])

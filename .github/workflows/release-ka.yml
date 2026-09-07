@@ -1,0 +1,64 @@
+# Сборка bsl-indexer для контура агента 1С по тегу v<версия автора>-ka.<N> (ветка build/ka-combined:
+# релиз автора + PR-ветки форм/СКД и scope у грепов). Только Windows x64: контур работает на Windows,
+# демон стоит нативно (ТЗ_Контур_агента_1С §7.3). Матрица автора (release.yml) на эти теги не
+# запускается — там стоит условие на «-ka.». Публикуется как pre-release в этот форк; контур
+# скачивает bsl-indexer.exe по CODE_INDEX_VERSION (install/fetch_bins.py).
+#
+# Тег ставит scripts/release_ka.py (тесты локально, тег, push); запасной путь без Actions —
+# `python scripts/release_ka.py --local` (сборка и публикация с машины; этот прогон тогда перезальёт ассет).
+name: Release KA build
+
+on:
+  push:
+    tags:
+      - 'v*-ka.*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ka-windows
+
+      - name: Версия Cargo.toml совпадает с базой тега
+        shell: bash
+        run: |
+          BASE=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
+          echo "Cargo.toml: $BASE, тег: $GITHUB_REF_NAME"
+          case "$GITHUB_REF_NAME" in "v$BASE-ka."*) ;; *) echo "Тег не вида v$BASE-ka.N"; exit 1;; esac
+          echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+
+      - name: cargo test --workspace --all-targets
+        shell: bash
+        run: cargo test --workspace --all-targets
+
+      - name: cargo build --release -p bsl-indexer --features enrichment
+        shell: bash
+        run: |
+          cargo build --release -p bsl-indexer --features enrichment
+          ls -l target/release/bsl-indexer.exe
+          ./target/release/bsl-indexer.exe --version
+
+      - name: GitHub Release (pre-release в форк)
+        shell: bash
+        run: |
+          NOTES="Сборка bsl-indexer для контура агента 1С: ветка build/ka-combined (релиз автора ${VERSION%-ka.*} + PR-ветки форм/СКД и scope у грепов). Состав — CHANGELOG.md, раздел Unreleased."
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "Релиз $GITHUB_REF_NAME уже есть (release_ka.py --local) — обновляю ассет"
+            gh release upload "$GITHUB_REF_NAME" target/release/bsl-indexer.exe --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" target/release/bsl-indexer.exe \
+              --title "bsl-indexer $VERSION" --notes "$NOTES" --prerelease
+          fi
+          gh release view "$GITHUB_REF_NAME" --json assets --jq '.assets[] | "\(.name) \(.size)"'
