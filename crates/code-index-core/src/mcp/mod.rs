@@ -328,6 +328,11 @@ pub struct GrepTextParams {
     pub limit: Option<usize>,
     /// Сколько строк до/после совпадения возвращать в `context`. 0 — без контекста.
     pub context_lines: Option<usize>,
+    /// Категория хранения: `code` (file_contents: .bsl, .py и объектные XML 1С с
+    /// language=xml_1c), `text` (text_contents: Configuration.xml, Form.xml, Rights.xml,
+    /// md, yaml, json) или `all` — обе категории одним вызовом с `by_category` в ответе.
+    /// По умолчанию — категория самого инструмента, ответы прежних вызовов не меняются.
+    pub scope: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -353,6 +358,11 @@ pub struct GrepCodeParams {
     pub limit: Option<usize>,
     /// Сколько строк до/после совпадения возвращать в `context`. 0 — без контекста.
     pub context_lines: Option<usize>,
+    /// Категория хранения: `code` (file_contents: .bsl, .py и объектные XML 1С с
+    /// language=xml_1c), `text` (text_contents: Configuration.xml, Form.xml, Rights.xml,
+    /// md, yaml, json) или `all` — обе категории одним вызовом с `by_category` в ответе.
+    /// По умолчанию — категория самого инструмента, ответы прежних вызовов не меняются.
+    pub scope: Option<String>,
 }
 
 /// Универсальные параметры для federation-форварда extension-tools
@@ -1221,8 +1231,8 @@ impl CodeIndexServer {
         tools::read_file(entry, p.path, p.line_start, p.line_end).await
     }
 
-    #[tool(description = "Regex-поиск по содержимому text-файлов (параметр regex=, синоним query=; pattern= — буквальная подстрока без учёта регистра, как в grep_body). path_glob ИЛИ language обязательно желателен (full-scan по всем text-файлам — дорого); альтернативы `{a,b}` в path_glob поддерживаются. context_lines — N строк до/после. limit — число находок (default 30 при full-scan); при обрезке truncated=true. Возвращает {files: {\"<path>\": [\"N: content\", …]}, shown, limit, truncated} — строки \"номер: содержимое\"; контекст (context_lines>0) влит в тот же массив, отсортирован по номеру строки.")]
-    async fn grep_text(&self, Parameters(mut p): Parameters<GrepTextParams>) -> String {
+    #[tool(description = "Regex-поиск по содержимому text-файлов (параметр regex=, синоним query=; pattern= — буквальная подстрока без учёта регистра, как в grep_body). path_glob ИЛИ language обязательно желателен (full-scan по всем text-файлам — дорого); альтернативы `{a,b}` в path_glob поддерживаются. Объектные XML 1С (Catalogs/X.xml, документы, регистры, подсистемы) здесь НЕ лежат — они разобраны как код с language=xml_1c (grep_code); здесь Configuration.xml, Form.xml, Rights.xml, md, json, yaml. scope=\"all\" — обе категории одним вызовом, в ответе by_category и truncated_by_category. context_lines — N строк до/после. limit — число находок (default 30 при full-scan); при обрезке truncated=true. Возвращает {files: {\"<path>\": [\"N: content\", …]}, shown, limit, truncated} — строки \"номер: содержимое\"; контекст (context_lines>0) влит в тот же массив, отсортирован по номеру строки.")]
+    async fn grep_text(&self, Parameters(p): Parameters<GrepTextParams>) -> String {
         let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };
         // `query` — алиас для `regex`, `pattern` — буквальная подстрока
         // (частая путаница моделей: имя переносится от grep_body/list_files).
@@ -1230,20 +1240,34 @@ impl CodeIndexServer {
             Some(r) => r,
             None => return "{\"error\": \"grep_text: укажите regex= (синтаксис crate regex) либо pattern= (буквальная подстрока). Для кода .bsl/.py/.rs — grep_code; для тел функций — grep_body.\"}".to_string(),
         };
+        let scope = match tools::grep_scope_from_param(p.scope.as_deref(), "text") {
+            Ok(s) => s,
+            Err(j) => return j,
+        };
         if !entry.is_local {
             // Ключи сводим ДО пересылки: узел может быть на прежней сборке, где
-            // поля `pattern` ещё нет, и при разборе оно бы потерялось.
-            p.regex = Some(regex);
-            p.query = None;
-            p.pattern = None;
-            return crate::federation::dispatcher::dispatch_remote(
-                &self.clients, &entry.ip, entry.port, "grep_text", &p,
-            ).await;
+            // полей `pattern` и `scope` ещё нет, и при разборе они бы потерялись.
+            // scope=all для удалённого репо — два обычных вызова и слияние здесь.
+            return self.dispatch_grep_remote(entry, scope, GrepCodeParams {
+                repo: p.repo.clone(),
+                regex: Some(regex),
+                query: None,
+                pattern: None,
+                path_glob: p.path_glob.clone(),
+                language: p.language.clone(),
+                limit: p.limit,
+                context_lines: p.context_lines,
+                scope: None,
+            }).await;
         }
-        tools::grep_text(entry, regex, p.path_glob, p.language, p.limit, p.context_lines).await
+        match scope {
+            "all" => tools::grep_all(entry, regex, p.path_glob, p.language, p.limit, p.context_lines).await,
+            "code" => tools::grep_code(entry, regex, p.path_glob, p.language, p.limit, p.context_lines).await,
+            _ => tools::grep_text(entry, regex, p.path_glob, p.language, p.limit, p.context_lines).await,
+        }
     }
 
-    #[tool(description = "Regex-поиск по ПОЛНОМУ тексту code-файлов (Phase 2, v0.8.0; параметр regex=, синоним query=; pattern= — буквальная подстрока без учёта регистра, как в grep_body): ищет по ВСЕМУ файлу — и module-level (объявления Перем, таблицы маршрутизации/инициализации, константы, строковые литералы, комментарии, импорты), И внутри тел функций/классов. Это НАДмножество grep_body по покрытию текста. Для поиска ВСЕХ вхождений имени/строки где угодно в файле (например имя веб-сервиса в таблице маршрутизации + его же использование в теле) — бери grep_code, НЕ grep_body (тот видит только тела и пропустит module-level). grep_body — когда нужно узнать, в какой ИМЕННО функции/процедуре встречается паттерн. Источник — таблица file_contents (zstd). path_glob ИЛИ language обязательно желателен (full-scan дорогой из-за zstd-decode каждого файла); альтернативы `{a,b}` в path_glob поддерживаются. Файлы oversize=true пропускаются. limit — число совпадений (default 30); при обрезке truncated=true (дошлите больший limit). Возвращает {files: {\"<path>\": [\"N: content\", …]}, shown, limit, truncated} — строки \"номер: содержимое\"; контекст (context_lines>0) влит в тот же массив, отсортирован по номеру строки.")]
+    #[tool(description = "Regex-поиск по ПОЛНОМУ тексту code-файлов (Phase 2, v0.8.0; параметр regex=, синоним query=; pattern= — буквальная подстрока без учёта регистра, как в grep_body): ищет по ВСЕМУ файлу — и module-level (объявления Перем, таблицы маршрутизации/инициализации, константы, строковые литералы, комментарии, импорты), И внутри тел функций/классов. Это НАДмножество grep_body по покрытию текста. Для поиска ВСЕХ вхождений имени/строки где угодно в файле (например имя веб-сервиса в таблице маршрутизации + его же использование в теле) — бери grep_code, НЕ grep_body (тот видит только тела и пропустит module-level). grep_body — когда нужно узнать, в какой ИМЕННО функции/процедуре встречается паттерн. Источник — таблица file_contents (zstd). path_glob ИЛИ language обязательно желателен (full-scan дорогой из-за zstd-decode каждого файла); альтернативы `{a,b}` в path_glob поддерживаются. Объектные XML выгрузки 1С (Catalogs/X.xml, документы, регистры, подсистемы) хранятся ЗДЕСЬ как код с language=\"xml_1c\"; Configuration.xml, Form.xml, Rights.xml — категория text (grep_text). Нужно всё сразу («где в выгрузке встречается имя») — scope=\"all\": обе категории одним вызовом, в ответе by_category и truncated_by_category; language при этом сужает только код. Файлы oversize=true пропускаются. limit — число совпадений (default 30); при обрезке truncated=true (дошлите больший limit). Возвращает {files: {\"<path>\": [\"N: content\", …]}, shown, limit, truncated} — строки \"номер: содержимое\"; контекст (context_lines>0) влит в тот же массив, отсортирован по номеру строки.")]
     async fn grep_code(&self, Parameters(mut p): Parameters<GrepCodeParams>) -> String {
         let entry = match self.resolve_repo(&p.repo) { Ok(e) => e, Err(j) => return j };
         // `query` — алиас для `regex`, `pattern` — буквальная подстрока
@@ -1252,17 +1276,61 @@ impl CodeIndexServer {
             Some(r) => r,
             None => return "{\"error\": \"grep_code: укажите regex= (синтаксис crate regex) либо pattern= (буквальная подстрока). Для тел функций/классов — grep_body; для xml/md/yaml — grep_text.\"}".to_string(),
         };
+        let scope = match tools::grep_scope_from_param(p.scope.as_deref(), "code") {
+            Ok(s) => s,
+            Err(j) => return j,
+        };
         if !entry.is_local {
             // Ключи сводим ДО пересылки: узел может быть на прежней сборке, где
-            // поля `pattern` ещё нет, и при разборе оно бы потерялось.
+            // полей `pattern` и `scope` ещё нет, и при разборе они бы потерялись.
+            // scope=all для удалённого репо — два обычных вызова и слияние здесь.
             p.regex = Some(regex);
             p.query = None;
             p.pattern = None;
-            return crate::federation::dispatcher::dispatch_remote(
-                &self.clients, &entry.ip, entry.port, "grep_code", &p,
-            ).await;
+            p.scope = None;
+            return self.dispatch_grep_remote(entry, scope, p).await;
         }
-        tools::grep_code(entry, regex, p.path_glob, p.language, p.limit, p.context_lines).await
+        match scope {
+            "all" => tools::grep_all(entry, regex, p.path_glob, p.language, p.limit, p.context_lines).await,
+            "text" => tools::grep_text(entry, regex, p.path_glob, p.language, p.limit, p.context_lines).await,
+            _ => tools::grep_code(entry, regex, p.path_glob, p.language, p.limit, p.context_lines).await,
+        }
+    }
+
+    /// grep_code/grep_text на удалённом репо с учётом scope: `code` и `text` — один
+    /// форвард на одноимённый инструмент; `all` — оба форварда и слияние ответов
+    /// локально (`merge_grep_payloads`), чтобы ноды прежних сборок без `scope`
+    /// продолжали работать. Параметры уже сведены к `regex` (см. вызывающие).
+    async fn dispatch_grep_remote(&self, entry: &RepoEntry, scope: &str, p: GrepCodeParams) -> String {
+        match scope {
+            "all" => {
+                let code = crate::federation::dispatcher::dispatch_remote(
+                    &self.clients, &entry.ip, entry.port, "grep_code", &p,
+                ).await;
+                // language сужает только код: у text-файлов языка в смысле парсера нет.
+                let text_params = GrepCodeParams {
+                    repo: p.repo.clone(),
+                    regex: p.regex.clone(),
+                    query: None,
+                    pattern: None,
+                    path_glob: p.path_glob.clone(),
+                    language: None,
+                    limit: p.limit,
+                    context_lines: p.context_lines,
+                    scope: None,
+                };
+                let text = crate::federation::dispatcher::dispatch_remote(
+                    &self.clients, &entry.ip, entry.port, "grep_text", &text_params,
+                ).await;
+                tools::merge_grep_payloads(&code, &text)
+            }
+            "text" => crate::federation::dispatcher::dispatch_remote(
+                &self.clients, &entry.ip, entry.port, "grep_text", &p,
+            ).await,
+            _ => crate::federation::dispatcher::dispatch_remote(
+                &self.clients, &entry.ip, entry.port, "grep_code", &p,
+            ).await,
+        }
     }
 
     #[tool(description = "Проверка живости MCP-сервера и демона индексации по всем подключённым репо. Возвращает JSON.")]

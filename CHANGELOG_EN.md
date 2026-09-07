@@ -5,6 +5,26 @@ Russian version: [CHANGELOG.md](CHANGELOG.md).
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning — [SemVer](https://semver.org/).
 
+## [Unreleased]
+
+**Text search across all storage categories in one call.**
+
+> Context. 1C dump XML is indexed two ways: object XML (catalogs, documents, registers, subsystems) is parsed and stored as code with language `xml_1c`, while `Configuration.xml`, `Form.xml` and `Rights.xml` are stored as text. On a 125k-file dump, "where does this object name occur" gave `grep_text` 4 files out of 10 and `grep_code(language="bsl")` 1, and neither answer said the rest lives in the other category. Spec: `docs/tz-grep-all-categories.md`.
+
+### Added
+
+- **`scope` parameter on `grep_code` and `grep_text`:** `code`, `text` or `all`. Defaults to the tool's own category, so existing calls are unchanged. `scope="all"` runs both searches with the same `regex`/`pattern`, `path_glob`, `limit` and `context_lines` (code first — twenty times smaller than text by volume, text on the remaining shared limit) and merges them into the same `{files, shown, limit, truncated}`; `by_category` (files per category) and `truncated_by_category` sit beside it — when code exhausts the limit, text is reported as truncated, not empty. `language` narrows code only under `scope="all"`. On a 1C repository without `path_glob` the answer reminds that `ConfigDumpInfo.xml` and `Template.xml` are not indexed.
+- **Remote repos:** `scope="all"` on a federation node is served by two ordinary forwards (`grep_code` and `grep_text`) merged on the caller side, so nodes on older builds that do not know `scope` keep working.
+
+### Changed
+
+- **Grep descriptions and empty-result hints** now say where 1C object XML lives (`grep_code`, `language="xml_1c"`) and how to search everything at once (`scope="all"`): an empty `grep_code` with `language="bsl"` or `grep_text` over `**/*.xml` no longer reads as "the name is absent elsewhere".
+
+### Verification
+
+- Unit tests: category merge cross-checked against separate calls, shared limit marking the skipped category, remote payload merge, `scope` value parsing. `cargo test --workspace --all-targets` — 821 passed, 0 failed.
+- Live check on a 125k-file 1C dump: `grep_code(pattern="КРБ_Тягачи", scope="all")` — 10 files, `by_category` code 6 / text 4, matching the sum of three separate calls; `limit=3` — `truncated=true` flagged for both categories; `grep_text` without `scope` answers as before; `scope="everything"` is rejected.
+
 ## [1.0.1] — 2026-08-28
 
 **A role-rights query no longer runs a spurious second branch, nor carries a hint about an object that was never asked for.**

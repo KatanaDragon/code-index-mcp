@@ -121,8 +121,9 @@ pub(crate) const HINT_FIND_SYMBOL_EMPTY: &str = "Символ не найден 
 Для нечёткого поиска по словам — search_function/search_class; по коду — grep_code(regex=…).";
 /// grep_code вернул 0 совпадений.
 pub(crate) const HINT_GREP_CODE_EMPTY: &str = "0 совпадений. Параметр называется regex= (синтаксис crate regex), не query=. \
-Поиск по ВСЕМУ коду файла. Только по телам функций/классов — grep_body; по xml/md/yaml/json — grep_text. \
-Проверьте language=/path_glob= (oversize-файлы пропускаются).";
+Поиск по ВСЕМУ коду файла. Только по телам функций/классов — grep_body; по Configuration.xml/Form.xml/Rights.xml/md/yaml/json — grep_text. \
+Объектные XML 1С (Catalogs/X.xml, документы, регистры, подсистемы) — это КОД с language=\"xml_1c\"; \
+все категории одним вызовом — scope=\"all\". Проверьте language=/path_glob= (oversize-файлы пропускаются).";
 /// grep_body вернул 0 совпадений.
 pub(crate) const HINT_GREP_BODY_EMPTY: &str = "0 совпадений в телах функций/классов. \
 Для module-level кода, комментариев и идентификаторов ВНЕ тел — grep_code(regex=…); по xml/md/yaml — grep_text. \
@@ -136,7 +137,13 @@ pub(crate) const HINT_GREP_TEXT_EMPTY: &str = "0 совпадений в text-ф
 Для кода .bsl/.py/.rs и т.п. — grep_code(regex=…) или grep_body. Проверьте path_glob=/language=. \
 ▸ XML ОБЪЕКТОВ 1С (справочники, документы, регистры, роли, определяемые типы, формы) с 0.51.0 \
 разбирается как КОД — по ним ищет grep_code(regex=…). Здесь же остаются оглавление конфигурации \
-(Configuration.xml) и прочие XML без объекта метаданных.";
+(Configuration.xml) и прочие XML без объекта метаданных. Все категории одним вызовом — scope=\"all\".";
+/// grep_* со scope=all вернул 0 совпадений в обеих категориях.
+pub(crate) const HINT_GREP_ALL_EMPTY: &str = "0 совпадений при scope=all: ни в code-файлах (включая объектные XML 1С, language=xml_1c), ни в text-файлах. \
+Параметры: pattern= (подстрока без учёта регистра) или regex=. Проверьте path_glob=; language= сужает только код. \
+ConfigDumpInfo.xml и макеты Template.xml не индексируются — по ним только внешний grep.";
+/// Что не входит в индекс выгрузки 1С — напоминание рядом с ответом scope=all без сужения по пути.
+pub(crate) const NOTE_GREP_ALL_EXCLUDED_1C: &str = "ConfigDumpInfo.xml (опись выгрузки) и Template.xml (макеты) не индексируются — при необходимости искать по ним внешним grep.";
 /// search_text вернул 0 совпадений.
 pub(crate) const HINT_SEARCH_TEXT_EMPTY: &str = "0 совпадений в text-файлах. Это нечёткий FTS-поиск по словам. \
 Для regex по тексту — grep_text(regex=…); для кода — grep_code(regex=…)/grep_body.";
@@ -150,8 +157,9 @@ pub(crate) const HINT_SEARCH_TEXT_EMPTY: &str = "0 совпадений в text-
 // пустой grep_body не звал в search_terms). std::concat! требует литералы —
 // поэтому хвост выписан в каждой константе целиком (без внешних крейтов).
 pub(crate) const HINT_GREP_CODE_EMPTY_BSL: &str = "0 совпадений. Параметр называется regex= (синтаксис crate regex), не query=. \
-Поиск по ВСЕМУ коду файла. Только по телам функций/классов — grep_body; по xml/md/yaml/json — grep_text. \
-Проверьте language=/path_glob= (oversize-файлы пропускаются). \
+Поиск по ВСЕМУ коду файла. Только по телам функций/классов — grep_body; по Configuration.xml/Form.xml/Rights.xml/md/yaml/json — grep_text. \
+Объектные XML 1С (Catalogs/X.xml, документы, регистры, подсистемы) — это КОД с language=\"xml_1c\"; \
+все категории одним вызовом — scope=\"all\". Проверьте language=/path_glob= (oversize-файлы пропускаются). \
 ▸ grep ищет ТОЧНЫЙ текст в файлах — он пуст, если слово в другой форме/регистре или код в общем модуле БСП. \
 search_terms(query=…) идёт по ДРУГОМУ, триграммному FTS-индексу (словоформы, регистр/ё неважны, подстроки ≥3) \
 по обогащённым термам = имя процедуры + СИНОНИМ объекта-владельца + комментарий — находит по смыслу то, что точный grep пропускает. Дай 1-3 слова.";
@@ -2100,6 +2108,178 @@ pub async fn grep_code(
     }
 }
 
+/// Значение параметра `scope` грепов: по умолчанию — категория самого инструмента.
+/// Ошибка — JSON для клиента (неизвестное значение).
+pub(crate) fn grep_scope_from_param(scope: Option<&str>, default: &'static str) -> Result<&'static str, String> {
+    match scope.map(|s| s.trim().to_ascii_lowercase()) {
+        None => Ok(default),
+        Some(s) if s.is_empty() => Ok(default),
+        Some(s) if s == "code" => Ok("code"),
+        Some(s) if s == "text" => Ok("text"),
+        Some(s) if s == "all" => Ok("all"),
+        Some(s) => Err(format!(
+            "{{\"error\": \"scope={}: допустимо code, text или all\"}}",
+            s
+        )),
+    }
+}
+
+/// grep по обеим категориям хранения одним вызовом (scope=all): сначала code
+/// (`file_contents`, включая объектные XML 1С с language=xml_1c — он в 20 раз меньше
+/// текста по объёму), затем text (`text_contents`) на остаток лимита. Ответ — тот же
+/// `{files, shown, limit, truncated}` плюс `by_category` (файлов по категориям) и
+/// `truncated_by_category`: неполнота должна быть видна по категориям, иначе
+/// повторяется исходная проблема — «в остальных файлах имени нет» по половине данных.
+///
+/// `language` фильтрует только код: у text-файлов языка в смысле парсера нет.
+pub(crate) fn grep_all_in_storage(
+    storage: &crate::storage::Storage,
+    regex: &str,
+    path_glob: Option<&str>,
+    language: Option<&str>,
+    want: usize,
+    context_lines: usize,
+    repo_language: Option<&str>,
+) -> anyhow::Result<(serde_json::Value, Vec<String>, usize)> {
+    let (code_matches, code_truncated, code_unreadable) =
+        storage.grep_code_filtered(regex, path_glob, language, want, context_lines, GREP_TOTAL_BYTES_CAP)?;
+    let remaining = want.saturating_sub(code_matches.len());
+    // Лимит исчерпан кодом — текст не запрашиваем, но честно помечаем его обрезанным:
+    // «пусто» и «не искали» для клиента должны различаться.
+    let (text_matches, text_truncated, text_unreadable) = if remaining > 0 {
+        storage.grep_text_filtered(regex, path_glob, None, remaining, context_lines, GREP_TOTAL_BYTES_CAP)?
+    } else {
+        (Vec::new(), true, 0)
+    };
+    let code_file_count = code_matches.iter().map(|m| m.path.as_str()).collect::<std::collections::BTreeSet<_>>().len();
+    let text_file_count = text_matches.iter().map(|m| m.path.as_str()).collect::<std::collections::BTreeSet<_>>().len();
+    let mut all: Vec<crate::storage::models::GrepTextMatch> = code_matches;
+    all.extend(text_matches);
+    let deps: Vec<String> = all.iter().map(|m| m.path.clone()).collect();
+    let shown = all.len();
+    let mut payload = serde_json::json!({
+        "files": compact_text_matches(&all),
+        "shown": shown,
+        "limit": want,
+        "truncated": code_truncated || text_truncated,
+        "scope": "all",
+        "by_category": { "code": code_file_count, "text": text_file_count },
+        "truncated_by_category": { "code": code_truncated, "text": text_truncated },
+    });
+    annotate_unreadable(&mut payload, code_unreadable + text_unreadable);
+    // Напоминание о неиндексируемых файлах выгрузки 1С — по содержимому индекса (есть
+    // объектные XML), а не только по языку записи репо: в режиме `serve --config` без
+    // serve.toml язык записи не заполнен.
+    if path_glob.is_none() && (repo_language == Some("bsl") || storage.has_language("xml_1c")) {
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert("excluded".to_string(), serde_json::json!(NOTE_GREP_ALL_EXCLUDED_1C));
+        }
+    }
+    Ok((payload, deps, shown))
+}
+
+/// scope=all для local-репо: обёртка над `grep_all_in_storage` с проверкой готовности
+/// индекса и `_meta`, как у `grep_code`/`grep_text`.
+pub async fn grep_all(
+    entry: &RepoEntry,
+    regex: String,
+    path_glob: Option<String>,
+    language: Option<String>,
+    limit: Option<usize>,
+    context_lines: Option<usize>,
+) -> String {
+    bail_if_not_ready!(entry);
+    let storage = acquire_storage!(entry);
+    let want = limit.unwrap_or(GREP_CODE_DEFAULT_LIMIT);
+    match grep_all_in_storage(
+        &storage,
+        &regex,
+        path_glob.as_deref(),
+        language.as_deref(),
+        want,
+        context_lines.unwrap_or(0),
+        entry.language.as_deref(),
+    ) {
+        Ok((payload, deps, shown)) => {
+            let hint = if shown == 0 { Some(HINT_GREP_ALL_EMPTY) } else { None };
+            wrap_with_meta_hint(&storage, &payload, deps, hint)
+        }
+        Err(e) => format!("{{\"error\": \"grep scope=all: {}\"}}", e),
+    }
+}
+
+/// Слияние двух ответов грепов (code и text), полученных от УДАЛЁННОЙ ноды: старая
+/// сборка поле `scope` не знает, поэтому scope=all для remote выполняется двумя
+/// обычными вызовами с локальной стороны. Форма каждого ответа —
+/// `{result:{files,shown,limit,truncated,...}, _meta:{dependent_files,file_mtimes}, hint?}`;
+/// ответ-ошибка одной стороны отдаётся как есть, если вторая тоже не разобралась.
+pub(crate) fn merge_grep_payloads(code_json: &str, text_json: &str) -> String {
+    let code: serde_json::Value = match serde_json::from_str(code_json) {
+        Ok(v) => v,
+        Err(_) => return code_json.to_string(),
+    };
+    let text: serde_json::Value = match serde_json::from_str(text_json) {
+        Ok(v) => v,
+        Err(_) => return text_json.to_string(),
+    };
+    if code.get("result").is_none() {
+        return code_json.to_string();
+    }
+    if text.get("result").is_none() {
+        return text_json.to_string();
+    }
+    let files_of = |v: &serde_json::Value| -> serde_json::Map<String, serde_json::Value> {
+        v["result"]["files"].as_object().cloned().unwrap_or_default()
+    };
+    let code_files = files_of(&code);
+    let text_files = files_of(&text);
+    let mut files = code_files.clone();
+    for (k, v) in &text_files {
+        files.entry(k.clone()).or_insert_with(|| v.clone());
+    }
+    let shown = code["result"]["shown"].as_u64().unwrap_or(0) + text["result"]["shown"].as_u64().unwrap_or(0);
+    let code_tr = code["result"]["truncated"].as_bool().unwrap_or(false);
+    let text_tr = text["result"]["truncated"].as_bool().unwrap_or(false);
+    let unreadable = code["result"]["files_unreadable"].as_u64().unwrap_or(0)
+        + text["result"]["files_unreadable"].as_u64().unwrap_or(0);
+    let mut result = serde_json::json!({
+        "files": files,
+        "shown": shown,
+        "limit": code["result"]["limit"].clone(),
+        "truncated": code_tr || text_tr,
+        "scope": "all",
+        "by_category": { "code": code_files.len(), "text": text_files.len() },
+        "truncated_by_category": { "code": code_tr, "text": text_tr },
+    });
+    if unreadable > 0 {
+        annotate_unreadable(&mut result, unreadable as usize);
+    }
+    let mut deps: Vec<serde_json::Value> = Vec::new();
+    let mut mtimes = serde_json::Map::new();
+    for side in [&code, &text] {
+        if let Some(arr) = side["_meta"]["dependent_files"].as_array() {
+            for d in arr {
+                if !deps.contains(d) {
+                    deps.push(d.clone());
+                }
+            }
+        }
+        if let Some(m) = side["_meta"]["file_mtimes"].as_object() {
+            for (k, v) in m {
+                mtimes.entry(k.clone()).or_insert_with(|| v.clone());
+            }
+        }
+    }
+    let mut wrapped = serde_json::json!({
+        "result": result,
+        "_meta": { "dependent_files": deps, "file_mtimes": mtimes },
+    });
+    if shown == 0 {
+        wrapped["hint"] = serde_json::json!(HINT_GREP_ALL_EMPTY);
+    }
+    wrapped.to_string()
+}
+
 /// Дописать в ответ поиска признак непрочитанных файлов. Молчаливый пропуск
 /// битого/не-UTF-8 содержимого делал неполную выдачу неотличимой от честного
 /// «ничего не найдено» — при нуле пропусков поле не появляется вовсе.
@@ -2173,6 +2353,133 @@ mod tests {
     use super::*;
     use crate::storage::{PoolConfig, Storage, StoragePool};
     use std::time::{Duration, Instant};
+
+    fn file_record(path: &str, language: &str) -> crate::storage::models::FileRecord {
+        crate::storage::models::FileRecord {
+            id: None,
+            path: path.to_string(),
+            content_hash: format!("hash_{}", path),
+            language: language.to_string(),
+            lines_total: 3,
+            indexed_at: "2026-09-07T12:00:00".to_string(),
+            mtime: Some(1_757_200_000),
+            file_size: Some(150),
+        }
+    }
+
+    /// ТЗ tz-grep-all-categories: scope=all находит имя и в code (объектный XML 1С
+    /// как язык xml_1c, модуль bsl), и в text (Configuration.xml) одним вызовом,
+    /// а счётчики по категориям сходятся с раздельными вызовами.
+    #[test]
+    fn grep_all_merges_code_and_text_categories() {
+        let storage = Storage::open_in_memory().unwrap();
+        let obj = storage.upsert_file(&file_record("Catalogs/КРБ_Тягачи.xml", "xml_1c")).unwrap();
+        storage.upsert_file_content(obj, "<MetaDataObject>\n<Name>КРБ_Тягачи</Name>\n</MetaDataObject>\n", 4096).unwrap();
+        let module = storage.upsert_file(&file_record("Documents/X/Ext/ObjectModule.bsl", "bsl")).unwrap();
+        storage.upsert_file_content(module, "Процедура А()\n\tТ = Справочники.КРБ_Тягачи;\nКонецПроцедуры\n", 4096).unwrap();
+        let cfg = storage.upsert_file(&file_record("Configuration.xml", "text")).unwrap();
+        storage.insert_text_file(&crate::storage::models::TextFileRecord {
+            id: None,
+            file_id: cfg,
+            content: "<ChildObjects>\n<Catalog>КРБ_Тягачи</Catalog>\n</ChildObjects>\n".to_string(),
+        }).unwrap();
+        let other = storage.upsert_file(&file_record("README.md", "text")).unwrap();
+        storage.insert_text_file(&crate::storage::models::TextFileRecord {
+            id: None,
+            file_id: other,
+            content: "Про тягачи ничего.\n".to_string(),
+        }).unwrap();
+
+        let (payload, deps, shown) =
+            grep_all_in_storage(&storage, "(?i)КРБ_Тягачи", None, None, 30, 0, Some("bsl")).unwrap();
+        assert_eq!(shown, 3, "по одному совпадению в трёх файлах");
+        assert_eq!(payload["by_category"]["code"], serde_json::json!(2));
+        assert_eq!(payload["by_category"]["text"], serde_json::json!(1));
+        assert_eq!(payload["truncated"], serde_json::json!(false));
+        assert_eq!(payload["scope"], serde_json::json!("all"));
+        let files = payload["files"].as_object().unwrap();
+        assert!(files.contains_key("Catalogs/КРБ_Тягачи.xml"), "объектный XML найден как код");
+        assert!(files.contains_key("Configuration.xml"), "оглавление найдено как текст");
+        assert!(files.contains_key("Documents/X/Ext/ObjectModule.bsl"));
+        assert_eq!(deps.len(), 3);
+        assert!(payload["excluded"].as_str().unwrap().contains("ConfigDumpInfo.xml"), "напоминание про исключённые файлы на BSL-репо без path_glob");
+
+        // Сверка с раздельными вызовами: сумма категорий совпадает.
+        let (code, _, _) = storage.grep_code_filtered("(?i)КРБ_Тягачи", None, None, 30, 0, 1_000_000).unwrap();
+        let (text, _, _) = storage.grep_text_filtered("(?i)КРБ_Тягачи", None, None, 30, 0, 1_000_000).unwrap();
+        assert_eq!(code.len() + text.len(), shown);
+
+        // language сужает только код: text-совпадение остаётся.
+        let (p2, _, shown2) = grep_all_in_storage(&storage, "(?i)КРБ_Тягачи", None, Some("xml_1c"), 30, 0, Some("bsl")).unwrap();
+        assert_eq!(shown2, 2);
+        assert_eq!(p2["by_category"]["code"], serde_json::json!(1));
+        assert_eq!(p2["by_category"]["text"], serde_json::json!(1));
+
+        // path_glob действует на обе категории; напоминания про исключённые файлы нет.
+        let (p3, _, shown3) = grep_all_in_storage(&storage, "(?i)КРБ_Тягачи", Some("**/*.xml"), None, 30, 0, Some("bsl")).unwrap();
+        assert_eq!(shown3, 2);
+        assert!(p3.get("excluded").is_none());
+    }
+
+    /// Лимит общий: код исчерпал его — текст не запрашивается, но помечен обрезанным,
+    /// чтобы «не искали» не читалось как «пусто».
+    #[test]
+    fn grep_all_shared_limit_marks_skipped_text_as_truncated() {
+        let storage = Storage::open_in_memory().unwrap();
+        let a = storage.upsert_file(&file_record("a.bsl", "bsl")).unwrap();
+        storage.upsert_file_content(a, "Имя\nИмя\nИмя\n", 4096).unwrap();
+        let cfg = storage.upsert_file(&file_record("Configuration.xml", "text")).unwrap();
+        storage.insert_text_file(&crate::storage::models::TextFileRecord {
+            id: None,
+            file_id: cfg,
+            content: "<Catalog>Имя</Catalog>\n".to_string(),
+        }).unwrap();
+        let (payload, _, shown) = grep_all_in_storage(&storage, "Имя", None, None, 2, 0, None).unwrap();
+        assert_eq!(shown, 2);
+        assert_eq!(payload["truncated"], serde_json::json!(true));
+        assert_eq!(payload["truncated_by_category"]["text"], serde_json::json!(true));
+        assert_eq!(payload["by_category"]["text"], serde_json::json!(0));
+        assert!(payload.get("excluded").is_none(), "не BSL-репо — напоминания нет");
+    }
+
+    /// Слияние ответов удалённой ноды (старой сборки без scope): файлы объединяются,
+    /// счётчики складываются, зависимые файлы — без дублей.
+    #[test]
+    fn merge_grep_payloads_unions_files_and_meta() {
+        let code = serde_json::json!({
+            "result": {"files": {"a.bsl": ["1: x"]}, "shown": 1, "limit": 30, "truncated": false},
+            "_meta": {"dependent_files": ["a.bsl"], "file_mtimes": {"a.bsl": 1}}
+        }).to_string();
+        let text = serde_json::json!({
+            "result": {"files": {"Configuration.xml": ["5: x"]}, "shown": 1, "limit": 30, "truncated": true, "files_unreadable": 1},
+            "_meta": {"dependent_files": ["Configuration.xml", "a.bsl"], "file_mtimes": {"Configuration.xml": 2}}
+        }).to_string();
+        let merged: serde_json::Value = serde_json::from_str(&merge_grep_payloads(&code, &text)).unwrap();
+        assert_eq!(merged["result"]["shown"], serde_json::json!(2));
+        assert_eq!(merged["result"]["truncated"], serde_json::json!(true));
+        assert_eq!(merged["result"]["truncated_by_category"]["code"], serde_json::json!(false));
+        assert_eq!(merged["result"]["by_category"]["text"], serde_json::json!(1));
+        assert_eq!(merged["result"]["files_unreadable"], serde_json::json!(1));
+        assert_eq!(merged["_meta"]["dependent_files"].as_array().unwrap().len(), 2);
+        assert!(merged.get("hint").is_none());
+
+        // Ошибка одной стороны отдаётся как есть.
+        let err = "{\"error\": \"remote down\"}";
+        assert_eq!(merge_grep_payloads(err, &text), err);
+
+        // Пусто с обеих сторон — подсказка scope=all.
+        let empty = serde_json::json!({"result": {"files": {}, "shown": 0, "limit": 30, "truncated": false}, "_meta": {"dependent_files": [], "file_mtimes": {}}}).to_string();
+        let m2: serde_json::Value = serde_json::from_str(&merge_grep_payloads(&empty, &empty)).unwrap();
+        assert!(m2["hint"].as_str().unwrap().contains("scope"));
+    }
+
+    #[test]
+    fn grep_scope_from_param_defaults_and_validates() {
+        assert_eq!(grep_scope_from_param(None, "code").unwrap(), "code");
+        assert_eq!(grep_scope_from_param(Some(""), "text").unwrap(), "text");
+        assert_eq!(grep_scope_from_param(Some(" ALL "), "code").unwrap(), "all");
+        assert!(grep_scope_from_param(Some("everything"), "code").is_err());
+    }
 
     /// M-6: пост-фильтр по образцу пути обязан находить файлы в КОРНЕ репо.
     /// До правки `**/` схлопывался в `*/`, разделитель оставался обязательным,
