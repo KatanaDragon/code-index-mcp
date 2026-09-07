@@ -80,7 +80,10 @@ def выпуск_через_actions(a, branch: str, version: str, tag: str) -> i
         print(f"Тег {tag} уже есть — укажите --build с другим номером")
         return 2
     run(["git", "tag", "-a", tag, "-m", f"bsl-indexer {version} (сборка контура 1С)"])
-    code, out = run(["git", "push", a.remote, "HEAD", tag])
+    # Ветка и тег - двумя push: тег в одном push с веткой не запускал workflow по тегу (проверено 07.09.2026).
+    code, out = run(["git", "push", a.remote, "HEAD"])
+    if code == 0:
+        code, out = run(["git", "push", a.remote, tag])
     if code != 0:
         print(out[-2000:])
         return 1
@@ -165,7 +168,10 @@ def main() -> int:
         print(f"Тег {tag} уже есть — укажите --build с другим номером")
         return 2
     run(["git", "tag", "-a", tag, "-m", f"bsl-indexer {version} (сборка контура 1С)"])
-    code, out = run(["git", "push", a.remote, "HEAD", tag])
+    # Ветка и тег - двумя push: тег в одном push с веткой не запускал workflow по тегу (проверено 07.09.2026).
+    code, out = run(["git", "push", a.remote, "HEAD"])
+    if code == 0:
+        code, out = run(["git", "push", a.remote, tag])
     if code != 0:
         print(out[-2000:])
         return 1
