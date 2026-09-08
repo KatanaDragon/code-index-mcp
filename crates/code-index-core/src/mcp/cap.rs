@@ -524,10 +524,31 @@ pub fn cap_response(mut value: Value, budget: usize) -> (Value, bool) {
                 .entry(format!("{}_total", key))
                 .or_insert(json!(orig_len));
             parent.insert(format!("{}_truncated", key), json!(true));
+            reconcile_counters(parent, orig_len, (orig_len / 2).max(1));
         }
         any = true;
     }
     (value, any)
+}
+
+/// Согласовать собственные счётчики инструмента с обрезанным массивом.
+///
+/// Инструмент сам пишет рядом с массивом `count` (сколько отдал) и
+/// `truncated: false` (ничего не режу). Когда затем `cap_response` укорачивает
+/// массив, эти поля начинают лгать: `get_event_subscriptions` отвечал
+/// `count: 214, truncated: false` при 13 элементах в `subscriptions` (КА,
+/// 08.09.2026) — агент верил `count` и не искал `subscriptions_truncated`.
+/// Правило узкое, чтобы не задеть чужие числа: `count`/`shown`, равные ПРЕЖНЕЙ
+/// длине массива, получают новую длину; `truncated: false` становится `true`.
+fn reconcile_counters(parent: &mut serde_json::Map<String, Value>, orig_len: usize, new_len: usize) {
+    for key in ["count", "shown"] {
+        if parent.get(key).and_then(|v| v.as_u64()) == Some(orig_len as u64) {
+            parent.insert(key.to_string(), json!(new_len));
+        }
+    }
+    if parent.get("truncated") == Some(&Value::Bool(false)) {
+        parent.insert("truncated".to_string(), json!(true));
+    }
 }
 
 // ── Свёртка секции и страницы по байтам ────────────────────────────────────
@@ -651,6 +672,35 @@ mod tests {
         let (out, trunc) = cap_response(v.clone(), 10_000);
         assert!(!trunc);
         assert_eq!(out, v);
+    }
+
+    #[test]
+    fn truncation_reconciles_tool_counters() {
+        // Как get_event_subscriptions: count и truncated — поля инструмента.
+        let items: Vec<Value> = (0..200).map(|i| json!({"name": format!("Подписка{}", i), "sources": ["a", "b"]})).collect();
+        let v = json!({"subscriptions": items, "count": 200, "total": 200, "truncated": false, "limit": 2000});
+        let (out, trunc) = cap_response(v, 2_000);
+        assert!(trunc);
+        let shown = out["subscriptions"].as_array().unwrap().len();
+        assert!(shown < 200);
+        assert_eq!(out["subscriptions_total"], json!(200));
+        assert_eq!(out["subscriptions_truncated"], json!(true));
+        // Счётчик отдачи и признак обрезки говорят правду; total остаётся исходным.
+        assert_eq!(out["count"], json!(shown));
+        assert_eq!(out["truncated"], json!(true));
+        assert_eq!(out["total"], json!(200));
+        assert_eq!(out["limit"], json!(2000));
+    }
+
+    #[test]
+    fn truncation_leaves_unrelated_counters() {
+        // count, не равный длине массива, — чужое число, его не трогаем.
+        let items: Vec<Value> = (0..100).map(|i| json!({"n": i, "pad": "x".repeat(40)})).collect();
+        let v = json!({"items": items, "count": 7, "truncated": true});
+        let (out, trunc) = cap_response(v, 1_000);
+        assert!(trunc);
+        assert_eq!(out["count"], json!(7));
+        assert_eq!(out["truncated"], json!(true));
     }
 
     #[test]

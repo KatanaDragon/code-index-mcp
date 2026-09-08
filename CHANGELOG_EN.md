@@ -7,6 +7,20 @@ Versioning — [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+**Callers of a 1C common- or manager-module procedure are found by bare name, and a tool's own counters tell the truth after the size cap trims the response.**
+
+> Context. A bench of five compound questions over a 125k-file 1C dump compared a chain of named tools with a single `bsl_sql`. Two discrepancies turned out to be tool defects rather than bench errors.
+
+### Fixed
+
+- **`get_callers` by bare name sees `Module.Name` calls.** A call to an exported procedure of a common module is stored qualified — `ПродажиСервер.ЗаполнитьАдрес` — while the lookup compared names by exact equality, so `get_callers(function_name="ЗаполнитьАдрес")` answered "0 edges": of 210 exported procedures of one module, 53 looked dead while only 6 really had no callers. A bare name is now expanded with the qualified forms derived from where the procedure is defined: `CommonModules/M/Ext/Module.bsl` → `M.Name`, `Catalogs/C/Ext/ManagerModule.bsl` → `Справочники.C.Name` and `Catalogs.C.Name` (a table maps dump folders to manager collections). Same-named procedures of other modules without such a definition are not mixed in. A qualified name (`M.Name`) is still looked up as is — that is how to ask about one module's procedure. The empty-result hint no longer tells to drop the module name.
+- **A tool's own counters agree with the size cap.** `cap_response` halved the heaviest array and placed `<key>_total`/`<key>_truncated` beside it, but the tool's own fields stayed: `get_event_subscriptions(event="ПередЗаписью", limit=2000)` answered `count: 214, truncated: false` with 13 subscriptions in the array — the agent trusted `count`. Now `count`/`shown` equal to the previous array length take the new length and `truncated: false` becomes `true`; `total` stays original. Numbers not equal to the array length are left alone.
+
+### Verification
+
+- Unit tests: qualifiers from the dump layout, caller lookup by bare and qualified name and with a language filter, counter reconciliation and untouched unrelated numbers. `cargo test --workspace --all-targets` — 838 passed, 0 failed.
+- Live check on the 1C dump: `get_callers` by the bare name of a common module's exported procedure — 2 callers (was 0); the list of dead exported procedures by tools matched `bsl_sql` — 6; `get_event_subscriptions` by event — `count` equals the array length, `truncated: true`.
+
 **An object's impact map now sees forms and data composition schemas: form attributes and parameters, dynamic lists and DCS queries no longer fall out of reference search.**
 
 ### Added

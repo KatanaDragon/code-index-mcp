@@ -1669,26 +1669,71 @@ impl Storage {
         }
     }
 
-    /// Найти все вызовы, где данная функция является callee
+    /// Найти все вызовы, где данная функция является callee.
+    ///
+    /// Голое имя (без точки) дополняется квалифицированными формами по местам
+    /// его определения (см. `callee_name_variants`): процедура `X` из
+    /// `CommonModules/M/Ext/Module.bsl` вызывается как `M.X`, из
+    /// `Catalogs/C/Ext/ManagerModule.bsl` — как `Справочники.C.X`. Без этого
+    /// экспортная процедура общего модуля отвечала «0 вызывающих», хотя рёбра
+    /// `M.X` в графе были: на конфигурации КА (08.09.2026) 53 из 210 процедур
+    /// одного модуля выглядели мёртвыми, реально без вызывающих было 6.
+    /// Квалифицированное имя (`M.X`) ищется как есть — это способ спросить про
+    /// процедуру ОДНОГО модуля, отсекая одноимённые из других.
     pub fn get_callers(&self, function_name: &str, language: Option<&str>) -> Result<Vec<CallRecord>> {
-        match language {
-            Some(lang) => {
-                let mut stmt = self.conn.prepare(
-                    "SELECT c.id, c.file_id, c.caller, c.callee, c.line
-                     FROM calls c JOIN files fi ON fi.id = c.file_id
-                     WHERE c.callee = ?1 AND fi.language = ?2",
-                )?;
-                let rows = stmt.query_map(params![function_name, lang], row_to_call)?;
-                rows.map(|r| r.map_err(Into::into)).collect()
-            }
-            None => {
-                let mut stmt = self.conn.prepare(
-                    "SELECT id, file_id, caller, callee, line FROM calls WHERE callee = ?1",
-                )?;
-                let rows = stmt.query_map(params![function_name], row_to_call)?;
-                rows.map(|r| r.map_err(Into::into)).collect()
+        let names = self.callee_name_variants(function_name)?;
+        let placeholders = (1..=names.len())
+            .map(|i| format!("?{}", i))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut bind: Vec<&dyn rusqlite::ToSql> =
+            names.iter().map(|n| n as &dyn rusqlite::ToSql).collect();
+        let sql = match language {
+            Some(_) => format!(
+                "SELECT c.id, c.file_id, c.caller, c.callee, c.line
+                 FROM calls c JOIN files fi ON fi.id = c.file_id
+                 WHERE c.callee IN ({}) AND fi.language = ?{}
+                 ORDER BY c.id",
+                placeholders,
+                names.len() + 1
+            ),
+            None => format!(
+                "SELECT id, file_id, caller, callee, line FROM calls WHERE callee IN ({}) ORDER BY id",
+                placeholders
+            ),
+        };
+        if let Some(lang) = language.as_ref() {
+            bind.push(lang as &dyn rusqlite::ToSql);
+        }
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(bind.as_slice(), row_to_call)?;
+        rows.map(|r| r.map_err(Into::into)).collect()
+    }
+
+    /// Варианты записи вызываемого имени в `calls.callee` для голого имени
+    /// процедуры: само имя плюс `Квалификатор.Имя` по каждому файлу, где
+    /// процедура с таким именем определена. Квалификатор выводится из пути
+    /// файла по раскладке выгрузки 1С (`manager_qualifiers`). Имя с точкой
+    /// возвращается как есть — оно уже квалифицировано.
+    fn callee_name_variants(&self, function_name: &str) -> Result<Vec<String>> {
+        let mut names = vec![function_name.to_string()];
+        if function_name.contains('.') || function_name.is_empty() {
+            return Ok(names);
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT fi.path FROM functions f JOIN files fi ON fi.id = f.file_id
+             WHERE f.name = ?1",
+        )?;
+        let paths = stmt.query_map(params![function_name], |r| r.get::<_, String>(0))?;
+        for path in paths {
+            for q in manager_qualifiers(&path?) {
+                let full = format!("{}.{}", q, function_name);
+                if !names.contains(&full) {
+                    names.push(full);
+                }
             }
         }
+        Ok(names)
     }
 
     /// Кратчайший путь A→B в универсальном графе вызовов (итеративный cycle-safe BFS по `calls`).
@@ -3224,6 +3269,51 @@ fn row_to_import(row: &rusqlite::Row<'_>) -> rusqlite::Result<ImportRecord> {
     })
 }
 
+/// Папки выгрузки 1С, чьи объекты имеют менеджер-модуль, и имя коллекции
+/// менеджеров в коде (`Справочники.X.Метод`; для EN-конфигураций —
+/// `Catalogs.X.Method`). Совпадает с `METADATA_COLLECTIONS` расширения BSL.
+const MANAGER_FOLDERS: &[(&str, &str)] = &[
+    ("Catalogs", "Справочники"),
+    ("Documents", "Документы"),
+    ("DocumentJournals", "ЖурналыДокументов"),
+    ("Enums", "Перечисления"),
+    ("Reports", "Отчеты"),
+    ("DataProcessors", "Обработки"),
+    ("ChartsOfCharacteristicTypes", "ПланыВидовХарактеристик"),
+    ("ChartsOfAccounts", "ПланыСчетов"),
+    ("ChartsOfCalculationTypes", "ПланыВидовРасчета"),
+    ("InformationRegisters", "РегистрыСведений"),
+    ("AccumulationRegisters", "РегистрыНакопления"),
+    ("AccountingRegisters", "РегистрыБухгалтерии"),
+    ("CalculationRegisters", "РегистрыРасчета"),
+    ("BusinessProcesses", "БизнесПроцессы"),
+    ("Tasks", "Задачи"),
+    ("ExchangePlans", "ПланыОбмена"),
+    ("Sequences", "Последовательности"),
+];
+
+/// Квалификаторы, с которыми процедуры файла `path` вызываются из чужого кода
+/// в выгрузке 1С: общий модуль `CommonModules/M/Ext/Module.bsl` → `M`;
+/// менеджер-модуль `Catalogs/C/Ext/ManagerModule.bsl` → `Справочники.C` и
+/// `Catalogs.C`. Прочие модули (объекта, формы, набора записей) снаружи по
+/// имени не вызываются — пусто.
+pub(crate) fn manager_qualifiers(path: &str) -> Vec<String> {
+    let norm = path.replace('\\', "/");
+    let parts: Vec<&str> = norm.split('/').collect();
+    if parts.len() != 4 || parts[2] != "Ext" {
+        return Vec::new();
+    }
+    match (parts[0], parts[3]) {
+        ("CommonModules", "Module.bsl") => vec![parts[1].to_string()],
+        (folder, "ManagerModule.bsl") => MANAGER_FOLDERS
+            .iter()
+            .filter(|(en, _)| *en == folder)
+            .flat_map(|(en, ru)| [format!("{}.{}", ru, parts[1]), format!("{}.{}", en, parts[1])])
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 fn row_to_call(row: &rusqlite::Row<'_>) -> rusqlite::Result<CallRecord> {
     Ok(CallRecord {
         id:      Some(row.get(0)?),
@@ -3249,6 +3339,86 @@ fn row_to_variable(row: &rusqlite::Row<'_>) -> rusqlite::Result<VariableRecord> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn file(storage: &Storage, path: &str) -> i64 {
+        storage
+            .upsert_file(&FileRecord {
+                id: None,
+                path: path.to_string(),
+                content_hash: format!("h-{}", path),
+                language: "bsl".to_string(),
+                lines_total: 1,
+                indexed_at: "2026-01-01".to_string(),
+                mtime: None,
+                file_size: None,
+            })
+            .unwrap()
+    }
+
+    fn func(storage: &Storage, file_id: i64, name: &str) {
+        storage
+            .insert_functions(&[FunctionRecord {
+                file_id,
+                name: name.to_string(),
+                line_start: 1,
+                line_end: 2,
+                ..Default::default()
+            }])
+            .unwrap();
+    }
+
+    fn call(storage: &Storage, file_id: i64, caller: &str, callee: &str) {
+        storage
+            .insert_calls(&[CallRecord { id: None, file_id, caller: caller.to_string(), callee: callee.to_string(), line: 5 }])
+            .unwrap();
+    }
+
+    #[test]
+    fn manager_qualifiers_по_раскладке_выгрузки() {
+        assert_eq!(manager_qualifiers("CommonModules/ПродажиСервер/Ext/Module.bsl"), vec!["ПродажиСервер"]);
+        assert_eq!(
+            manager_qualifiers("Catalogs/Номенклатура/Ext/ManagerModule.bsl"),
+            vec!["Справочники.Номенклатура", "Catalogs.Номенклатура"]
+        );
+        assert_eq!(manager_qualifiers("Documents\\ЗаказКлиента\\Ext\\ManagerModule.bsl").len(), 2);
+        // Модуль объекта, формы, набора записей снаружи по имени не вызываются.
+        assert!(manager_qualifiers("Documents/ЗаказКлиента/Ext/ObjectModule.bsl").is_empty());
+        assert!(manager_qualifiers("Documents/ЗаказКлиента/Forms/ФормаДокумента/Ext/Form/Module.bsl").is_empty());
+        assert!(manager_qualifiers("src/main.rs").is_empty());
+    }
+
+    #[test]
+    fn get_callers_голое_имя_находит_квалифицированные_вызовы() {
+        let st = Storage::open_in_memory().unwrap();
+        let common = file(&st, "CommonModules/ПродажиСервер/Ext/Module.bsl");
+        func(&st, common, "ЗаполнитьАдрес");
+        let manager = file(&st, "Catalogs/Контрагенты/Ext/ManagerModule.bsl");
+        func(&st, manager, "ПолучитьАдрес");
+        let form = file(&st, "Documents/ЗаказКлиента/Forms/ФормаДокумента/Ext/Form/Module.bsl");
+        call(&st, form, "ПриСозданииНаСервере", "ПродажиСервер.ЗаполнитьАдрес");
+        call(&st, form, "ПриОткрытии", "Справочники.Контрагенты.ПолучитьАдрес");
+        call(&st, form, "ПриОткрытии", "ЗаполнитьАдрес"); // одноимённая локальная процедура формы
+        call(&st, form, "ПриОткрытии", "ДругойМодуль.ЗаполнитьАдрес"); // чужой модуль без такого определения
+
+        // Голое имя: прямые вызовы + `Модуль.Имя` по месту определения; `ДругойМодуль.X`
+        // не берётся — процедуры X в модуле ДругойМодуль в индексе нет.
+        let callees: Vec<String> =
+            st.get_callers("ЗаполнитьАдрес", None).unwrap().into_iter().map(|c| c.callee).collect();
+        assert_eq!(callees, vec!["ПродажиСервер.ЗаполнитьАдрес", "ЗаполнитьАдрес"]);
+        // Менеджер-модуль: русская коллекция.
+        let callees: Vec<String> =
+            st.get_callers("ПолучитьАдрес", None).unwrap().into_iter().map(|c| c.callee).collect();
+        assert_eq!(callees, vec!["Справочники.Контрагенты.ПолучитьАдрес"]);
+        // Квалифицированное имя — ровно оно, одноимённые из других мест отсечены.
+        let only: Vec<String> =
+            st.get_callers("ПродажиСервер.ЗаполнитьАдрес", None).unwrap().into_iter().map(|c| c.callee).collect();
+        assert_eq!(only, vec!["ПродажиСервер.ЗаполнитьАдрес"]);
+        // Фильтр языка сохраняет семантику.
+        assert_eq!(st.get_callers("ЗаполнитьАдрес", Some("bsl")).unwrap().len(), 2);
+        assert!(st.get_callers("ЗаполнитьАдрес", Some("python")).unwrap().is_empty());
+        // Имя без определений и без рёбер — пусто, без ошибки.
+        assert!(st.get_callers("НетТакой", None).unwrap().is_empty());
+    }
 
     #[test]
     fn rollback_batch_снимает_транзакцию_и_идемпотентен() {
