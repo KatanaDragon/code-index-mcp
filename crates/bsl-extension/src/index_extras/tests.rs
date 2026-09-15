@@ -1223,6 +1223,388 @@ fn incremental_terms_update_and_cleanup() {
     assert_eq!(after, 0, "после удаления файла mech-строки зачищены");
 }
 
+/// Фикстура модуля с шапкой и метатегами: общий модуль КРБ-образца из ТЗ —
+/// рамка, проза, `@layer`, `@tags`, затем экспортная функция с описанием,
+/// в конце которого стоят `@tags`/`@depends`/`@security`.
+fn write_header_fixture(repo: &Path, storage: &Storage) {
+    write(
+        &repo.join("Configuration.xml"),
+        r#"<?xml version="1.0"?>
+<MetaDataObject><Configuration><ChildObjects>
+<CommonModule>КРБ_ИнтеграцияВесов</CommonModule>
+</ChildObjects></Configuration></MetaDataObject>"#,
+    );
+    let module = repo
+        .join("CommonModules")
+        .join("КРБ_ИнтеграцияВесов")
+        .join("Ext")
+        .join("Module.bsl");
+    write(
+        &module,
+        "\u{feff}////////////////////////////////////////////////////\n\
+         // Общий модуль «КРБ_ИнтеграцияВесов» (флаг: Сервер).\n\
+         //\n\
+         // Опрашивает службу весов и хранит её настройки.\n\
+         //\n\
+         // @layer infra\n\
+         // @tags весы, служба, интеграция\n\
+         ////////////////////////////////////////////////////\n\
+         \n\
+         #Область ПрограммныйИнтерфейс\n\
+         \n\
+         // Читает настройки подключения к службе весов из безопасного хранилища БСП.\n\
+         //\n\
+         // @tags настройки, подключение\n\
+         // @depends РегистрСведений.БезопасноеХранилищеДанных; ОбщегоНазначения\n\
+         // @security читает адрес и порт локальной службы\n\
+         Функция ПрочитатьНастройки() Экспорт\n\
+         КонецФункции\n\
+         \n\
+         #КонецОбласти\n",
+    );
+    let conn = storage.conn();
+    conn.execute(
+        "INSERT INTO files (path, content_hash, language) \
+         VALUES ('CommonModules/КРБ_ИнтеграцияВесов/Ext/Module.bsl', 'h', 'bsl')",
+        [],
+    )
+    .unwrap();
+    let fid: i64 = conn
+        .query_row("SELECT id FROM files WHERE language='bsl'", [], |r| r.get(0))
+        .unwrap();
+    conn.execute(
+        "INSERT INTO functions (file_id, name, line_start) VALUES (?, 'ПрочитатьНастройки', 16)",
+        params![fid],
+    )
+    .unwrap();
+}
+
+const HEADER_MODULE_PATH: &str = "CommonModules/КРБ_ИнтеграцияВесов/Ext/Module.bsl";
+
+#[test]
+fn full_pass_fills_module_header_and_procedure_tags() {
+    let tmp = TempDir::new().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    let mut storage = fresh_storage(&tmp);
+    write_header_fixture(&repo, &storage);
+
+    run_index_extras(&repo, &mut storage).unwrap();
+
+    // Шапка модуля: проза, теги, зависимости — своей строкой.
+    let (header, mtags, depends, sig): (String, String, String, String) = storage
+        .conn()
+        .query_row(
+            "SELECT header, tags, depends, signature FROM module_enrichment \
+             WHERE repo = ?1 AND path = ?2",
+            params![REPO_DEFAULT, HEADER_MODULE_PATH],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap();
+    assert!(header.starts_with("Общий модуль «КРБ_ИнтеграцияВесов»"), "{header}");
+    assert!(header.contains("Опрашивает службу весов"), "{header}");
+    assert!(!header.contains('@'), "метатеги в прозе шапки не остаются: {header}");
+    assert_eq!(mtags, "весы, служба, интеграция");
+    assert!(depends.is_empty(), "в шапке фикстуры @depends нет: {depends}");
+    assert_eq!(sig, crate::terms::MECH_SIGNATURE);
+
+    // Процедура: теги, первая строка описания, длина описания.
+    let key = format!("{}::ПрочитатьНастройки", HEADER_MODULE_PATH);
+    let (terms, tags, head, len): (String, String, String, i64) = storage
+        .conn()
+        .query_row(
+            "SELECT terms, tags, comment_head, comment_len FROM procedure_enrichment \
+             WHERE repo = ?1 AND proc_key = ?2",
+            params![REPO_DEFAULT, &key],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(tags, "настройки, подключение");
+    assert_eq!(
+        head,
+        "Читает настройки подключения к службе весов из безопасного хранилища БСП."
+    );
+    assert!(
+        len > head.chars().count() as i64 * 2,
+        "длина описания считается целиком, включая строки метатегов: {len}"
+    );
+    // Порядок фраз: теги процедуры → имя → объект → синоним → проза → теги шапки.
+    assert!(terms.starts_with("настройки, подключение, прочитать настройки"), "{terms}");
+    assert!(terms.contains("весы"), "теги шапки в термах процедуры: {terms}");
+    assert!(!terms.contains("security"), "@security термов не даёт: {terms}");
+    assert!(!terms.contains("@"), "строки метатегов в термы не попадают: {terms}");
+
+    // FTS: запрос по тегу модуля и по тегу процедуры находит процедуру,
+    // хотя слова «весы» в имени и прозе нет.
+    for q in ["весы", "подключение"] {
+        let hits: i64 = storage
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM fts_procedure_enrichment \
+                 WHERE fts_procedure_enrichment MATCH ?1",
+                params![q],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(hits, 1, "FTS должен находить '{q}'");
+    }
+}
+
+#[test]
+fn incremental_updates_module_header_and_cleans_it_on_delete() {
+    let tmp = TempDir::new().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    let mut storage = fresh_storage(&tmp);
+    write_header_fixture(&repo, &storage);
+    run_index_extras(&repo, &mut storage).unwrap();
+
+    let module_abs = repo
+        .join("CommonModules")
+        .join("КРБ_ИнтеграцияВесов")
+        .join("Ext")
+        .join("Module.bsl");
+
+    // Шапку переписали: другая проза, другие теги.
+    write(
+        &module_abs,
+        "// Общий модуль обмена с весовым оборудованием.\n\
+         //\n\
+         // @tags оборудование, обмен\n\
+         \n\
+         // Читает настройки.\n\
+         Функция ПрочитатьНастройки() Экспорт\n\
+         КонецФункции\n",
+    );
+    {
+        let conn = storage.conn();
+        conn.execute(
+            "UPDATE functions SET line_start = 6 WHERE name = 'ПрочитатьНастройки'",
+            [],
+        )
+        .unwrap();
+    }
+    run_incremental_extras(&repo, &mut storage, &[module_abs.clone()], &[]).unwrap();
+
+    let (header, tags): (String, String) = storage
+        .conn()
+        .query_row(
+            "SELECT header, tags FROM module_enrichment WHERE repo = ?1 AND path = ?2",
+            params![REPO_DEFAULT, HEADER_MODULE_PATH],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(header, "Общий модуль обмена с весовым оборудованием.");
+    assert_eq!(tags, "оборудование, обмен");
+    let rows: i64 = storage
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM module_enrichment WHERE repo = ?1",
+            params![REPO_DEFAULT],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(rows, 1, "шапка обновляется, а не дублируется");
+    let terms: String = storage
+        .conn()
+        .query_row(
+            "SELECT terms FROM procedure_enrichment WHERE repo = ?1 AND proc_key = ?2",
+            params![REPO_DEFAULT, format!("{}::ПрочитатьНастройки", HEADER_MODULE_PATH)],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(terms.contains("оборудование"), "новые теги шапки в термах: {terms}");
+    assert!(!terms.contains("весы"), "прежних тегов шапки в термах нет: {terms}");
+
+    // Файл удалён → нет ни термов процедур, ни шапки.
+    std::fs::remove_file(&module_abs).unwrap();
+    run_incremental_extras(&repo, &mut storage, &[], &[module_abs]).unwrap();
+    for (table, what) in [("procedure_enrichment", "термы"), ("module_enrichment", "шапка")] {
+        let left: i64 = storage
+            .conn()
+            .query_row(
+                &format!("SELECT COUNT(*) FROM {} WHERE repo = ?1", table),
+                params![REPO_DEFAULT],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(left, 0, "после удаления файла {what} зачищены");
+    }
+}
+
+#[test]
+fn parse_collector_stages_header_and_terms() {
+    use code_index_core::extension::{ParseExtrasCollector, ParsedFileCtx};
+    use code_index_core::parser::{bsl::BslParser, LanguageParser};
+
+    let tmp = TempDir::new().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    let mut storage = fresh_storage(&tmp);
+    write_header_fixture(&repo, &storage);
+    let content = std::fs::read_to_string(
+        repo.join("CommonModules")
+            .join("КРБ_ИнтеграцияВесов")
+            .join("Ext")
+            .join("Module.bsl"),
+    )
+    .unwrap();
+    // Ядро снимает BOM при чтении — сборщик получает content уже без него.
+    let content = content.trim_start_matches('\u{feff}').to_string();
+    let parsed = BslParser::new().parse(&content, HEADER_MODULE_PATH).unwrap();
+
+    let collector = crate::parse_collector::BslParseCollector::new();
+    collector.begin(&mut storage).unwrap();
+    collector.on_parsed(ParsedFileCtx {
+        rel_path: HEADER_MODULE_PATH,
+        language: "bsl",
+        content: &content,
+        parse_result: Some(&parsed),
+    });
+    collector.write(&mut storage).unwrap();
+
+    // Сырьё в staging: шапка и разобранное описание процедуры.
+    let (staged_path, staged_tags): (String, String) = storage
+        .conn()
+        .query_row("SELECT path, tags FROM _module_header_staging", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    assert_eq!(staged_path, HEADER_MODULE_PATH);
+    assert_eq!(staged_tags, "весы, служба, интеграция");
+
+    // Синонимы объектов заполняет XML-слой, идущий раньше сборки из staging.
+    index_object_synonyms(&repo, storage.conn()).unwrap();
+    build_procedure_terms_from_staging(storage.conn()).unwrap();
+
+    let (header, mtags): (String, String) = storage
+        .conn()
+        .query_row(
+            "SELECT header, tags FROM module_enrichment WHERE repo = ?1 AND path = ?2",
+            params![REPO_DEFAULT, HEADER_MODULE_PATH],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert!(header.starts_with("Общий модуль «КРБ_ИнтеграцияВесов»"), "{header}");
+    assert_eq!(mtags, "весы, служба, интеграция");
+
+    let (terms, tags, head, len): (String, String, String, i64) = storage
+        .conn()
+        .query_row(
+            "SELECT terms, tags, comment_head, comment_len FROM procedure_enrichment \
+             WHERE repo = ?1 AND proc_key = ?2",
+            params![REPO_DEFAULT, format!("{}::ПрочитатьНастройки", HEADER_MODULE_PATH)],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(tags, "настройки, подключение");
+    assert!(head.starts_with("Читает настройки подключения"), "{head}");
+    assert!(len > 0);
+    assert!(terms.starts_with("настройки, подключение, прочитать настройки"), "{terms}");
+    assert!(terms.contains("весы"), "теги шапки из staging попали в термы: {terms}");
+    // Staging после сборки снят.
+    let left: i64 = storage
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_temp_master WHERE type='table' \
+             AND name IN ('_proc_terms_staging', '_module_header_staging')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(left, 0, "временные таблицы сырья дропаются после сборки");
+}
+
+#[test]
+fn signature_change_triggers_terms_rebuild_from_db() {
+    // Сценарий обновления бинарника: в базе термы прежней подписи, файлы не
+    // менялись. Открытие базы расширением (migrate_extensions) обязано
+    // пересобрать слой термов из сохранённого содержимого файлов — без
+    // переиндексации метаданных и графов.
+    let tmp = TempDir::new().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    let mut storage = fresh_storage(&tmp);
+    write_header_fixture(&repo, &storage);
+    let content = std::fs::read_to_string(
+        repo.join("CommonModules")
+            .join("КРБ_ИнтеграцияВесов")
+            .join("Ext")
+            .join("Module.bsl"),
+    )
+    .unwrap();
+    let fid: i64 = storage
+        .conn()
+        .query_row("SELECT id FROM files WHERE language='bsl'", [], |r| r.get(0))
+        .unwrap();
+    storage.upsert_file_content(fid, &content, 5 * 1024 * 1024).unwrap();
+
+    // Строка прежней сборки: одна проза, без тегов и шапки.
+    let key = format!("{}::ПрочитатьНастройки", HEADER_MODULE_PATH);
+    storage
+        .conn()
+        .execute(
+            "INSERT INTO procedure_enrichment (repo, proc_key, terms, signature, updated_at) \
+             VALUES (?1, ?2, 'прочитать настройки', 'mech:v1', 0)",
+            params![REPO_DEFAULT, &key],
+        )
+        .unwrap();
+    // …и LLM-строка соседней процедуры: её проход трогать не должен.
+    storage
+        .conn()
+        .execute(
+            "INSERT INTO procedure_enrichment (repo, proc_key, terms, signature, updated_at) \
+             VALUES (?1, 'X.bsl::Y', 'llm-термины', 'openai_compatible:m', 1)",
+            params![REPO_DEFAULT],
+        )
+        .unwrap();
+
+    crate::schema::migrate_extensions(storage.conn()).unwrap();
+
+    let (terms, tags, sig): (String, String, String) = storage
+        .conn()
+        .query_row(
+            "SELECT terms, tags, signature FROM procedure_enrichment \
+             WHERE repo = ?1 AND proc_key = ?2",
+            params![REPO_DEFAULT, &key],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(sig, crate::terms::MECH_SIGNATURE, "подпись обновлена");
+    assert_eq!(tags, "настройки, подключение");
+    assert!(terms.contains("весы"), "теги шапки подтянулись: {terms}");
+    let mtags: String = storage
+        .conn()
+        .query_row(
+            "SELECT tags FROM module_enrichment WHERE repo = ?1 AND path = ?2",
+            params![REPO_DEFAULT, HEADER_MODULE_PATH],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(mtags, "весы, служба, интеграция");
+    let llm: String = storage
+        .conn()
+        .query_row(
+            "SELECT terms FROM procedure_enrichment WHERE repo = ?1 AND proc_key = 'X.bsl::Y'",
+            params![REPO_DEFAULT],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(llm, "llm-термины", "LLM-строка не тронута");
+
+    // Повторное открытие базы прохода уже не делает (подпись совпала).
+    crate::schema::migrate_extensions(storage.conn()).unwrap();
+    let rows: i64 = storage
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM procedure_enrichment WHERE repo = ?1 AND signature LIKE 'mech:%'",
+            params![REPO_DEFAULT],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(rows, 1);
+}
+
 #[test]
 fn fills_event_subscriptions() {
     let tmp = TempDir::new().unwrap();

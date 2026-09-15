@@ -38,12 +38,28 @@ pub const MARK_PROC_TERMS: &str = "proc_terms";
 /// Одна строка сырья термов процедуры, собранная в фазе парсинга. Синоним
 /// объекта тут отсутствует намеренно — он ещё не заполнен (XML-слой идёт
 /// позже); подставляется по metadata_objects при сборке из staging.
+/// Описание уже разобрано (проза, первая строка, `@tags`, длина): разбор
+/// идёт в параллельной фазе, а не в серийной сборке из staging.
 struct StagedProcTerm {
     proc_key: String,
     proc_name: String,
     object_meta_type: Option<&'static str>,
     object_name: Option<String>,
-    comment: Option<String>,
+    comment_prose: String,
+    comment_head: String,
+    comment_tags: String,
+    /// Длина описания до обрезки; `0` — описания над процедурой нет.
+    comment_len: i64,
+}
+
+/// Шапка одного модуля, разобранная в фазе парсинга (см. `ModuleHeader`).
+/// Её теги идут в термы процедур этого же файла, поэтому собираются вместе
+/// с сырьём термов, а не отдельным обходом.
+struct StagedModuleHeader {
+    path: String,
+    header: String,
+    tags: String,
+    depends: String,
 }
 
 /// Сборщик extras BSL для параллельного парсинга. Копит сырьё потоко-безопасно
@@ -53,15 +69,18 @@ struct StagedProcTerm {
 pub struct BslParseCollector {
     /// Накопленные обращения к объектам МД: (file_path, обращения этого файла).
     code_usages: Mutex<Vec<(String, Vec<CodeUsage>)>>,
-    /// Сырьё термов процедур (имя + объект + комментарий), собранное в
-    /// парсинге. Синоним объекта подставляется позже, при сборке из staging.
+    /// Сырьё термов процедур (имя + объект + разобранное описание), собранное
+    /// в парсинге. Синоним объекта подставляется позже, при сборке из staging.
     proc_terms: Mutex<Vec<StagedProcTerm>>,
+    /// Шапки модулей (проза + метатеги) — по одной на .bsl с шапкой.
+    module_headers: Mutex<Vec<StagedModuleHeader>>,
     /// Сколько обращений, модулей и процедур уже сброшено в базу. Считаются
     /// отдельно: буферы после каждого сброса пусты, а в журнал нужен итог по
     /// всему проходу.
     written_usages: AtomicUsize,
     written_files: AtomicUsize,
     written_terms: AtomicUsize,
+    written_headers: AtomicUsize,
 }
 
 impl BslParseCollector {
@@ -86,13 +105,25 @@ impl ParseExtrasCollector for BslParseCollector {
                 .push((ctx.rel_path.to_string(), usages));
         }
 
-        // Слой 2: сырьё термов процедур (имя + объект + комментарий). Синоним
-        // объекта НЕ берём — он ещё не заполнен; подставится позже.
+        // Слой 2: сырьё термов процедур (имя + объект + разобранное описание)
+        // и шапка модуля. Синоним объекта НЕ берём — он ещё не заполнен;
+        // подставится позже, при сборке из staging.
+        let lines: Vec<&str> = ctx.content.lines().collect();
+        if let Some(h) = crate::terms::extract_module_header(&lines) {
+            self.module_headers
+                .lock()
+                .expect("BslParseCollector.module_headers mutex")
+                .push(StagedModuleHeader {
+                    path: ctx.rel_path.to_string(),
+                    tags: h.tags_line(),
+                    depends: h.depends_line(),
+                    header: h.prose,
+                });
+        }
         if let Some(pr) = ctx.parse_result {
             if !pr.functions.is_empty() {
                 use crate::terms::{extract_leading_comment, object_from_module_path};
                 let object = object_from_module_path(ctx.rel_path);
-                let lines: Vec<&str> = ctx.content.lines().collect();
                 let mut staged: Vec<StagedProcTerm> = Vec::with_capacity(pr.functions.len());
                 for f in &pr.functions {
                     let comment = extract_leading_comment(&lines, f.line_start);
@@ -101,7 +132,10 @@ impl ParseExtrasCollector for BslParseCollector {
                         proc_name: f.name.clone(),
                         object_meta_type: object.as_ref().map(|(mt, _)| *mt),
                         object_name: object.as_ref().map(|(_, nm)| nm.clone()),
-                        comment,
+                        comment_prose: comment.as_ref().map(|c| c.prose.clone()).unwrap_or_default(),
+                        comment_head: comment.as_ref().map(|c| c.head.clone()).unwrap_or_default(),
+                        comment_tags: comment.as_ref().map(|c| c.tags_line()).unwrap_or_default(),
+                        comment_len: comment.as_ref().map(|c| c.len_chars as i64).unwrap_or(0),
                     });
                 }
                 self.proc_terms
@@ -126,7 +160,9 @@ impl ParseExtrasCollector for BslParseCollector {
         )?;
         conn.execute_batch(
             "DROP TABLE IF EXISTS _proc_terms_staging; \
-             CREATE TEMP TABLE _proc_terms_staging (proc_key TEXT, proc_name TEXT, object_meta_type TEXT, object_name TEXT, comment TEXT);",
+             CREATE TEMP TABLE _proc_terms_staging (proc_key TEXT, proc_name TEXT, object_meta_type TEXT, object_name TEXT, comment_prose TEXT, comment_head TEXT, comment_tags TEXT, comment_len INTEGER); \
+             DROP TABLE IF EXISTS _module_header_staging; \
+             CREATE TEMP TABLE _module_header_staging (path TEXT, header TEXT, tags TEXT, depends TEXT);",
         )?;
         Ok(())
     }
@@ -148,15 +184,23 @@ impl ParseExtrasCollector for BslParseCollector {
                 .expect("BslParseCollector.proc_terms mutex");
             std::mem::take(&mut *guard)
         };
-        if files.is_empty() && terms.is_empty() {
+        let headers: Vec<StagedModuleHeader> = {
+            let mut guard = self
+                .module_headers
+                .lock()
+                .expect("BslParseCollector.module_headers mutex");
+            std::mem::take(&mut *guard)
+        };
+        if files.is_empty() && terms.is_empty() && headers.is_empty() {
             return Ok(());
         }
 
         let conn = storage.conn();
-        // Таблица сырья термов создаётся в begin; здесь страховка на случай
-        // вызова flush без него (одиночный проход старым порядком).
+        // Таблицы сырья создаются в begin; здесь страховка на случай вызова
+        // flush без него (одиночный проход старым порядком).
         conn.execute_batch(
-            "CREATE TEMP TABLE IF NOT EXISTS _proc_terms_staging (proc_key TEXT, proc_name TEXT, object_meta_type TEXT, object_name TEXT, comment TEXT);",
+            "CREATE TEMP TABLE IF NOT EXISTS _proc_terms_staging (proc_key TEXT, proc_name TEXT, object_meta_type TEXT, object_name TEXT, comment_prose TEXT, comment_head TEXT, comment_tags TEXT, comment_len INTEGER); \
+             CREATE TEMP TABLE IF NOT EXISTS _module_header_staging (path TEXT, header TEXT, tags TEXT, depends TEXT);",
         )?;
         conn.execute("BEGIN", [])?;
         let mut usages_written: usize = 0;
@@ -182,9 +226,24 @@ impl ParseExtrasCollector for BslParseCollector {
             }
         }
         {
-            let mut stmt = conn.prepare("INSERT INTO _proc_terms_staging (proc_key, proc_name, object_meta_type, object_name, comment) VALUES (?1, ?2, ?3, ?4, ?5)")?;
+            let mut stmt = conn.prepare("INSERT INTO _proc_terms_staging (proc_key, proc_name, object_meta_type, object_name, comment_prose, comment_head, comment_tags, comment_len) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)")?;
             for t in terms.iter() {
-                stmt.execute(params![&t.proc_key, &t.proc_name, t.object_meta_type, &t.object_name, &t.comment])?;
+                stmt.execute(params![
+                    &t.proc_key,
+                    &t.proc_name,
+                    t.object_meta_type,
+                    &t.object_name,
+                    &t.comment_prose,
+                    &t.comment_head,
+                    &t.comment_tags,
+                    t.comment_len
+                ])?;
+            }
+        }
+        {
+            let mut stmt = conn.prepare("INSERT INTO _module_header_staging (path, header, tags, depends) VALUES (?1, ?2, ?3, ?4)")?;
+            for h in headers.iter() {
+                stmt.execute(params![&h.path, &h.header, &h.tags, &h.depends])?;
             }
         }
         conn.execute("COMMIT", [])?;
@@ -192,6 +251,7 @@ impl ParseExtrasCollector for BslParseCollector {
         self.written_usages.fetch_add(usages_written, Ordering::Relaxed);
         self.written_files.fetch_add(files.len(), Ordering::Relaxed);
         self.written_terms.fetch_add(terms.len(), Ordering::Relaxed);
+        self.written_headers.fetch_add(headers.len(), Ordering::Relaxed);
         Ok(())
     }
 
@@ -214,8 +274,9 @@ impl ParseExtrasCollector for BslParseCollector {
         // build_procedure_terms_from_staging, ПОСЛЕ заполнения синонимов
         // XML-слоем. Здесь только сырьё.
         tracing::info!(
-            "procedure_terms (parse-collector): {} процедур в staging",
-            self.written_terms.load(Ordering::Relaxed)
+            "procedure_terms (parse-collector): {} процедур и {} шапок модулей в staging",
+            self.written_terms.load(Ordering::Relaxed),
+            self.written_headers.load(Ordering::Relaxed)
         );
 
         Ok(())

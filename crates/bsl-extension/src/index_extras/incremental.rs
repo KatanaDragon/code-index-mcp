@@ -1063,15 +1063,16 @@ pub(crate) fn update_code_usages_for_file(
 
 
 /// Per-file обновление механических термов для одного `.bsl`: снести свои
-/// (`mech:%`) строки файла и пересобрать по текущему состоянию `functions`
-/// (или просто снести, если файл удалён). LLM-строки не трогаются.
+/// (`mech:%`) строки файла и шапку модуля, пересобрать по текущему состоянию
+/// `functions` (или просто снести, если файл удалён). LLM-строки не трогаются.
 pub(crate) fn update_procedure_terms_for_file(
     repo_root: &Path,
     conn: &rusqlite::Connection,
     bsl_path: &Path,
 ) -> Result<()> {
     use crate::terms::{
-        build_terms, extract_leading_comment, object_from_module_path, MECH_SIGNATURE,
+        build_terms, extract_leading_comment, extract_module_header, object_from_module_path,
+        MECH_SIGNATURE,
     };
 
     let rel = rel_path(repo_root, bsl_path);
@@ -1091,6 +1092,12 @@ pub(crate) fn update_procedure_terms_for_file(
          WHERE repo = ?1 AND proc_key >= ?2 AND proc_key < ?3 AND signature LIKE 'mech:%'",
         params![REPO_DEFAULT, &pk_lo, &pk_hi],
     )?;
+    // Шапка модуля ведётся тем же тактом: строка пути сносится всегда и
+    // заводится заново по текущему тексту (у удалённого файла — только снос).
+    conn.execute(
+        "DELETE FROM module_enrichment WHERE repo = ?1 AND path = ?2",
+        params![REPO_DEFAULT, &rel],
+    )?;
     if bsl_path.is_file() {
         let procs: Vec<(String, i64)> = {
             let mut stmt = conn.prepare(
@@ -1101,10 +1108,36 @@ pub(crate) fn update_procedure_terms_for_file(
                 .query_map(params![&rel], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
             rows.flatten().collect()
         };
+        let lines: Vec<String> = std::fs::read_to_string(bsl_path)
+            .map(|c| c.lines().map(String::from).collect())
+            .unwrap_or_default();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let header = extract_module_header(&lines);
+        let module_tags: Vec<String> = header.as_ref().map(|h| h.tags.clone()).unwrap_or_default();
+        if let Some(h) = &header {
+            conn.execute(
+                "INSERT INTO module_enrichment \
+                 (repo, path, header, tags, depends, signature, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+                 ON CONFLICT(repo, path) DO UPDATE SET \
+                   header = excluded.header, tags = excluded.tags, \
+                   depends = excluded.depends, signature = excluded.signature, \
+                   updated_at = excluded.updated_at",
+                params![
+                    REPO_DEFAULT,
+                    &rel,
+                    &h.prose,
+                    h.tags_line(),
+                    h.depends_line(),
+                    MECH_SIGNATURE,
+                    now
+                ],
+            )?;
+        }
         if !procs.is_empty() {
-            let lines: Vec<String> = std::fs::read_to_string(bsl_path)
-                .map(|c| c.lines().map(String::from).collect())
-                .unwrap_or_default();
             let object = object_from_module_path(&rel);
             let synonym: Option<String> = object.as_ref().and_then(|(mt, nm)| {
                 conn.query_row(
@@ -1115,13 +1148,10 @@ pub(crate) fn update_procedure_terms_for_file(
                 .ok()
                 .flatten()
             });
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
             let mut ins = conn.prepare(
-                "INSERT INTO procedure_enrichment (repo, proc_key, terms, signature, updated_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(repo, proc_key) DO NOTHING",
+                "INSERT INTO procedure_enrichment \
+                 (repo, proc_key, terms, tags, comment_head, comment_len, signature, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) ON CONFLICT(repo, proc_key) DO NOTHING",
             )?;
             for (name, line_start) in &procs {
                 let comment = extract_leading_comment(&lines, (*line_start).max(0) as usize);
@@ -1129,13 +1159,23 @@ pub(crate) fn update_procedure_terms_for_file(
                     name,
                     object.as_ref().map(|(_, nm)| nm.as_str()),
                     synonym.as_deref(),
-                    comment.as_deref(),
+                    comment.as_ref(),
+                    &module_tags,
                 );
                 if terms.is_empty() {
                     continue;
                 }
                 let proc_key = format!("{}::{}", rel, name);
-                ins.execute(params![REPO_DEFAULT, proc_key, terms, MECH_SIGNATURE, now])?;
+                ins.execute(params![
+                    REPO_DEFAULT,
+                    proc_key,
+                    terms,
+                    comment.as_ref().map(|c| c.tags_line()).unwrap_or_default(),
+                    comment.as_ref().map(|c| c.head.clone()).unwrap_or_default(),
+                    comment.as_ref().map(|c| c.len_chars as i64).unwrap_or(0),
+                    MECH_SIGNATURE,
+                    now
+                ])?;
             }
         }
     }

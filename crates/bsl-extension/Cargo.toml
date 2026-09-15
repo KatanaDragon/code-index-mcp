@@ -54,6 +54,10 @@ rusqlite = { workspace = true }
 # Обход дерева репо при index_extras (этап 4c).
 walkdir = { workspace = true }
 
+# Разжатие сохранённого в базе текста модулей (`file_contents`): терм-проход
+# при смене подписи термов идёт по базе, без повторного обхода диска.
+zstd = { workspace = true }
+
 # CLI-парсинг для подкоманды `bsl-indexer enrich` (этап 5a).
 # Не под feature, потому что вход в подкоманду ловится в bsl-indexer/main.rs
 # через intercept argv[1] до core::cli::run, и это нужно в любой сборке —
