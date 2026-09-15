@@ -43,25 +43,54 @@ pub const METADATA_MODULES_INDEXES: &[&str] = &[
 /// DDL трёх FTS-триггеров `procedure_enrichment` (INSERT/DELETE/UPDATE) —
 /// отдельной константой, потому что переиспользуется и в SCHEMA_EXTENSIONS,
 /// и в bulk-пересборке термов (`build_procedure_terms_from_staging`), где
-/// триггеры снимаются на время массовой вставки и ставятся обратно.
+/// триггеры снимаются на время массовой вставки и ставятся обратно,
+/// и в миграции FTS на две колонки (`ensure_fts_tags_column`).
 pub const PE_FTS_TRIGGERS_DDL: &str = "
     CREATE TRIGGER IF NOT EXISTS pe_fts_insert
     AFTER INSERT ON procedure_enrichment BEGIN
-        INSERT INTO fts_procedure_enrichment(rowid, terms)
-        VALUES (new.id, new.terms);
+        INSERT INTO fts_procedure_enrichment(rowid, terms, tags)
+        VALUES (new.id, new.terms, new.tags);
     END;
     CREATE TRIGGER IF NOT EXISTS pe_fts_delete
     AFTER DELETE ON procedure_enrichment BEGIN
-        INSERT INTO fts_procedure_enrichment(fts_procedure_enrichment, rowid, terms)
-        VALUES ('delete', old.id, old.terms);
+        INSERT INTO fts_procedure_enrichment(fts_procedure_enrichment, rowid, terms, tags)
+        VALUES ('delete', old.id, old.terms, old.tags);
     END;
     CREATE TRIGGER IF NOT EXISTS pe_fts_update
     AFTER UPDATE ON procedure_enrichment BEGIN
-        INSERT INTO fts_procedure_enrichment(fts_procedure_enrichment, rowid, terms)
-        VALUES ('delete', old.id, old.terms);
-        INSERT INTO fts_procedure_enrichment(rowid, terms)
-        VALUES (new.id, new.terms);
+        INSERT INTO fts_procedure_enrichment(fts_procedure_enrichment, rowid, terms, tags)
+        VALUES ('delete', old.id, old.terms, old.tags);
+        INSERT INTO fts_procedure_enrichment(rowid, terms, tags)
+        VALUES (new.id, new.terms, new.tags);
     END;
+    ";
+
+/// Снятие тех же трёх триггеров. `CREATE TRIGGER IF NOT EXISTS` существующий
+/// триггер НЕ переписывает, поэтому при смене состава колонок FTS старые
+/// триггеры надо сначала удалить (см. `ensure_fts_tags_column`); bulk-вставка
+/// термов снимает их ради скорости.
+pub const PE_FTS_TRIGGERS_DROP: &str = "
+    DROP TRIGGER IF EXISTS pe_fts_insert;
+    DROP TRIGGER IF EXISTS pe_fts_delete;
+    DROP TRIGGER IF EXISTS pe_fts_update;
+    ";
+
+/// DDL `module_enrichment` — отдельной константой, потому что нужна и в
+/// SCHEMA_EXTENSIONS, и в `migrate_extensions`: терм-проход при смене подписи
+/// идёт ДО применения расширений схемы, а пишет в том числе шапки модулей.
+pub const MODULE_ENRICHMENT_DDL: &str = "
+    CREATE TABLE IF NOT EXISTS module_enrichment (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        repo TEXT NOT NULL,
+        path TEXT NOT NULL,
+        header TEXT NOT NULL,
+        tags TEXT NOT NULL DEFAULT '',
+        depends TEXT NOT NULL DEFAULT '',
+        signature TEXT NOT NULL,
+        updated_at INTEGER NOT NULL DEFAULT 0,
+        UNIQUE(repo, path)
+    );
+    CREATE INDEX IF NOT EXISTS idx_me_path ON module_enrichment(repo, path);
     ";
 
 /// CREATE TABLE / INDEX для специфичных 1С-таблиц.
@@ -325,12 +354,25 @@ pub const SCHEMA_EXTENSIONS: &[&str] = &[
     // `updated_at` — Unix epoch в секундах. Заполняется явно из Rust
     // (а не DEFAULT через strftime), потому что у нас разный приоритет
     // — bulk-import ставит время батча, а не каждой строки.
+    //
+    // `tags` / `comment_head` / `comment_len` — механический разбор описания
+    // над процедурой (только строки `signature LIKE 'mech:%'`; у LLM-строк
+    // они остаются по умолчанию):
+    //   * `tags`         — значения метатега `@tags` через запятую; отдельная
+    //     колонка нужна ради ВЕСА в FTS (см. fts_procedure_enrichment ниже);
+    //   * `comment_head` — первая содержательная строка описания (до 160
+    //     символов): её показывает `search_terms` вместо всей строки термов;
+    //   * `comment_len`  — длина описания до обрезки; `0` = описания нет,
+    //     по этой колонке считается аудит «экспортные без контракта».
     "
     CREATE TABLE IF NOT EXISTS procedure_enrichment (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         repo TEXT NOT NULL,
         proc_key TEXT NOT NULL,
         terms TEXT,
+        tags TEXT NOT NULL DEFAULT '',
+        comment_head TEXT NOT NULL DEFAULT '',
+        comment_len INTEGER NOT NULL DEFAULT 0,
         signature TEXT,
         updated_at INTEGER NOT NULL DEFAULT 0,
         UNIQUE(repo, proc_key)
@@ -353,9 +395,17 @@ pub const SCHEMA_EXTENSIONS: &[&str] = &[
     // запрос короче 3 символов не матчится. Цена — FTS-индекс ~3× толще
     // unicode61, на термах (не полнотекст) это десятки МБ на конфигурацию.
     // Миграция существующих БД — `ensure_trigram_tokenizer` (drop+rebuild).
+    //
+    // Колонок две: `terms` (проза, имя, объект, синоним) и `tags` (метатеги
+    // `@tags`, проставленные разработчиком руками). Запрос без указания
+    // колонки (`fts MATCH ?`) ищет по обеим, а ранжирование взвешивает их
+    // по-разному: `bm25(fts, 1.0, TAGS_BM25_WEIGHT)` — попадание в тег весит
+    // больше случайного совпадения слова в описании. Миграция существующих
+    // БД на две колонки — `ensure_fts_tags_column` (drop+rebuild+триггеры).
     "
     CREATE VIRTUAL TABLE IF NOT EXISTS fts_procedure_enrichment USING fts5(
         terms,
+        tags,
         content='procedure_enrichment',
         content_rowid='id',
         tokenize='trigram'
@@ -366,6 +416,20 @@ pub const SCHEMA_EXTENSIONS: &[&str] = &[
     // PE_FTS_TRIGGERS_DDL (переиспользуется bulk-пересборкой термов, где
     // триггеры снимаются на время массовой вставки и ставятся обратно).
     PE_FTS_TRIGGERS_DDL,
+
+    // ── module_enrichment ─────────────────────────────────────────────────
+    // Шапка модуля: комментарий в начале `.bsl` до первого объявления.
+    // Ровно один ряд на файл модуля (`path` — как `files.path`).
+    //
+    // Зачем отдельной таблицей, а не колонкой файла: шапка — надстройка BSL
+    // (ядро про неё не знает и хранит в `functions.docstring` совсем другое —
+    // метаинформацию объявления), и ведётся она тем же механизмом, что термы
+    // процедур: полный проход при индексации, пофайловый — при инкременте.
+    //
+    // `header` — проза шапки построчно (до 1000 символов), `tags`/`depends` —
+    // метатеги `@tags`/`@depends`; теги шапки идут ещё и в термы процедур
+    // этого модуля, поэтому отдельного поиска по модулям не нужно.
+    MODULE_ENRICHMENT_DDL,
 
     // ── embedding_meta ────────────────────────────────────────────────────
     // Глобальная (не per-repo) служебная таблица «ключ-значение» для
@@ -570,8 +634,82 @@ pub fn migrate_extensions(conn: &rusqlite::Connection) -> anyhow::Result<()> {
     ensure_column(conn, "metadata_objects", "sub_config", "TEXT NOT NULL DEFAULT ''")?;
     // Ключ имени объекта для регистронезависимого резолва на входе инструментов.
     ensure_column(conn, "metadata_objects", "full_name_key", "TEXT NOT NULL DEFAULT ''")?;
+    // Разбор описания процедуры: метатеги, первая строка, длина описания.
+    // Порядок важен: колонки должны появиться ДО пересоздания FTS и триггеров
+    // (они читают `new.tags`) и до терм-прохода, который в них пишет.
+    ensure_column(conn, "procedure_enrichment", "tags", "TEXT NOT NULL DEFAULT ''")?;
+    ensure_column(conn, "procedure_enrichment", "comment_head", "TEXT NOT NULL DEFAULT ''")?;
+    ensure_column(conn, "procedure_enrichment", "comment_len", "INTEGER NOT NULL DEFAULT 0")?;
     backfill_metadata_object_keys(conn)?;
     ensure_trigram_tokenizer(conn)?;
+    ensure_fts_tags_column(conn)?;
+    rebuild_terms_on_signature_change(conn)?;
+    Ok(())
+}
+
+/// Терм-проход при смене подписи механических термов (`mech:v1` → `mech:v2`).
+///
+/// Инкремент переписывает термы только изменённых файлов, поэтому после
+/// обновления бинарника база жила бы со старыми термами до следующей ПОЛНОЙ
+/// индексации (на конфигурации КА — 394 с). Здесь вместо неё выполняется
+/// только слой термов: описания процедур и шапки модулей перечитываются из
+/// уже сохранённого в базе содержимого файлов (`file_contents`), метаданные
+/// и графы не трогаются — десятки секунд вместо минут.
+///
+/// Вызывается при открытии базы расширением, до применения SCHEMA_EXTENSIONS,
+/// поэтому таблицу шапок модулей создаём здесь же. Пока проход идёт, папка
+/// числится индексируемой и `health` отвечает «не готов» — как при индексации.
+fn rebuild_terms_on_signature_change(conn: &rusqlite::Connection) -> anyhow::Result<()> {
+    let table_exists: i64 = conn.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='procedure_enrichment'",
+        [],
+        |r| r.get(0),
+    )?;
+    if table_exists == 0 {
+        return Ok(()); // свежая база — термы соберёт сама индексация
+    }
+    let stale: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM procedure_enrichment \
+             WHERE signature LIKE 'mech:%' AND signature <> ?1",
+            rusqlite::params![crate::terms::MECH_SIGNATURE],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    if stale == 0 {
+        return Ok(());
+    }
+    // Проход читает базовые таблицы ядра. В штатном порядке они создаются
+    // раньше расширений, но миграцию зовут и на голой БД (тесты схемы) —
+    // тогда термы просто соберёт ближайшая индексация.
+    let core_tables: i64 = conn.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE type='table' \
+         AND name IN ('files', 'functions', 'file_contents')",
+        [],
+        |r| r.get(0),
+    )?;
+    if core_tables < 3 {
+        tracing::info!(
+            "термы процедур: {} строк со старой подписью, но базовых таблиц ядра ещё нет — \
+             слой соберёт индексация",
+            stale
+        );
+        return Ok(());
+    }
+    conn.execute_batch(MODULE_ENRICHMENT_DDL)?;
+    tracing::info!(
+        "термы процедур: {} строк со старой подписью — пересобираю слой термов \
+         под {} (метаданные и графы не трогаются)",
+        stale,
+        crate::terms::MECH_SIGNATURE
+    );
+    let started = std::time::Instant::now();
+    let filled = crate::index_extras::rebuild_procedure_terms_from_db(conn)?;
+    tracing::info!(
+        "термы процедур: пересобрано {} процедур за {} мс",
+        filled,
+        started.elapsed().as_millis()
+    );
     Ok(())
 }
 
@@ -655,6 +793,65 @@ fn ensure_trigram_tokenizer(conn: &rusqlite::Connection) -> anyhow::Result<()> {
                  INSERT INTO fts_procedure_enrichment(fts_procedure_enrichment) VALUES('rebuild');",
             )?;
             tracing::info!("fts_procedure_enrichment: мигрирован на trigram-токенайзер");
+        }
+    }
+    Ok(())
+}
+
+/// Миграция: вторая колонка `tags` в FTS-индексе термов. Состав колонок
+/// виртуальной таблицы фиксируется при создании, `CREATE VIRTUAL TABLE IF NOT
+/// EXISTS` его не меняет — проверяем DDL в `sqlite_master` и при несовпадении
+/// пересоздаём таблицу с двумя колонками + `rebuild` из content-таблицы.
+///
+/// Отдельно проверяются ТРИГГЕРЫ: они пишут в FTS поколоночно
+/// (`new.terms, new.tags`), а `CREATE TRIGGER IF NOT EXISTS` существующий
+/// триггер не переписывает — старые надо снять явно. Проверка независимая:
+/// база, где таблица уже мигрирована, а триггеры остались старыми (обрыв
+/// посреди миграции), чинится следующим открытием.
+///
+/// Требует, чтобы колонка `procedure_enrichment.tags` уже существовала
+/// (её добавляет `ensure_column` выше по `migrate_extensions`).
+/// На свежей БД (FTS ещё нет) — no-op: SCHEMA_EXTENSIONS создаст сразу две.
+fn ensure_fts_tags_column(conn: &rusqlite::Connection) -> anyhow::Result<()> {
+    use rusqlite::OptionalExtension;
+    let fts_ddl: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='fts_procedure_enrichment'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(fts_ddl) = fts_ddl else {
+        return Ok(());
+    };
+    if !fts_ddl.contains("tags") {
+        conn.execute_batch(
+            "DROP TABLE fts_procedure_enrichment;
+             CREATE VIRTUAL TABLE fts_procedure_enrichment USING fts5(
+                 terms,
+                 tags,
+                 content='procedure_enrichment',
+                 content_rowid='id',
+                 tokenize='trigram'
+             );
+             INSERT INTO fts_procedure_enrichment(fts_procedure_enrichment) VALUES('rebuild');",
+        )?;
+        tracing::info!(
+            "fts_procedure_enrichment: добавлена колонка tags, индекс перестроен"
+        );
+    }
+    let trigger_ddl: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='pe_fts_insert'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(ddl) = trigger_ddl {
+        if !ddl.contains("tags") {
+            conn.execute_batch(PE_FTS_TRIGGERS_DROP)?;
+            conn.execute_batch(PE_FTS_TRIGGERS_DDL)?;
+            tracing::info!("fts_procedure_enrichment: триггеры пересозданы под колонку tags");
         }
     }
     Ok(())
@@ -1008,6 +1205,17 @@ mod tests {
                  tokenize='unicode61 remove_diacritics 1');",
         )
         .unwrap();
+        // ...и триггеры той же поры — по одной колонке (иначе вставка ниже
+        // упала бы на несуществующей в старой FTS колонке tags).
+        conn.execute_batch(
+            "DROP TRIGGER IF EXISTS pe_fts_insert;
+             DROP TRIGGER IF EXISTS pe_fts_delete;
+             DROP TRIGGER IF EXISTS pe_fts_update;
+             CREATE TRIGGER pe_fts_insert AFTER INSERT ON procedure_enrichment BEGIN
+                 INSERT INTO fts_procedure_enrichment(rowid, terms) VALUES (new.id, new.terms);
+             END;",
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO procedure_enrichment (repo, proc_key, terms, signature, updated_at) \
              VALUES ('ut', 'A.bsl::P', 'уточнить данные по штрихкоду', 'mech:v1', 0)",
@@ -1034,6 +1242,7 @@ mod tests {
             )
             .unwrap();
         assert!(ddl.contains("trigram"), "после миграции токенайзер trigram: {ddl}");
+        assert!(ddl.contains("tags"), "после миграции в FTS две колонки: {ddl}");
         // Substring и словоформа находятся; индекс пересобран из content-таблицы.
         for q in ["трихкод", "штрихкоду", "УТОЧНИТЬ"] {
             let hits: i64 = conn
@@ -1046,6 +1255,95 @@ mod tests {
             assert_eq!(hits, 1, "trigram должен находить '{q}'");
         }
         // Повторный вызов — no-op (идемпотентность).
+        migrate_extensions(&conn).unwrap();
+    }
+
+    #[test]
+    fn migrate_adds_tags_column_and_rebuilds_fts_with_triggers() {
+        // Эмуляция БД прежней сборки: в procedure_enrichment нет колонок
+        // разбора описания, FTS — по одной колонке, триггеры — под неё же.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE procedure_enrichment (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 repo TEXT NOT NULL, proc_key TEXT NOT NULL, terms TEXT,
+                 signature TEXT, updated_at INTEGER NOT NULL DEFAULT 0,
+                 UNIQUE(repo, proc_key));
+             CREATE VIRTUAL TABLE fts_procedure_enrichment USING fts5(
+                 terms, content='procedure_enrichment', content_rowid='id',
+                 tokenize='trigram');
+             CREATE TRIGGER pe_fts_insert AFTER INSERT ON procedure_enrichment BEGIN
+                 INSERT INTO fts_procedure_enrichment(rowid, terms) VALUES (new.id, new.terms);
+             END;",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO procedure_enrichment (repo, proc_key, terms, signature, updated_at) \
+             VALUES ('ut', 'A.bsl::P', 'уточнить штрихкод', 'mech:v2', 0)",
+            [],
+        )
+        .unwrap();
+
+        migrate_extensions(&conn).unwrap();
+        // Колонки разбора описания добавлены ALTER'ом, значения по умолчанию.
+        for col in ["tags", "comment_head", "comment_len"] {
+            assert!(column_exists(&conn, "procedure_enrichment", col), "нет колонки {col}");
+        }
+        // Таблица шапок модулей заводится DDL расширений (здесь его нет), а
+        // FTS и триггеры мигрированы на две колонки.
+        let fts_ddl: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='fts_procedure_enrichment'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(fts_ddl.contains("tags"), "FTS на две колонки: {fts_ddl}");
+        let trg: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='pe_fts_insert'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(trg.contains("tags"), "триггер пишет обе колонки: {trg}");
+        for name in ["pe_fts_delete", "pe_fts_update"] {
+            let n: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name = ?1",
+                    [name],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 1, "триггер {name} должен быть на месте");
+        }
+        // Индекс пересобран: прежняя строка ищется и после пересоздания.
+        let hits: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM fts_procedure_enrichment WHERE fts_procedure_enrichment MATCH 'штрихкод'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(hits, 1, "rebuild должен вернуть прежнюю строку в индекс");
+
+        // Новая строка с тегом ищется по второй колонке — через триггер insert.
+        conn.execute(
+            "INSERT INTO procedure_enrichment \
+             (repo, proc_key, terms, tags, comment_head, comment_len, signature, updated_at) \
+             VALUES ('ut', 'A.bsl::P2', 'считать вес', 'весы', 'Считает вес.', 12, 'mech:v2', 0)",
+            [],
+        )
+        .unwrap();
+        let by_tag: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM fts_procedure_enrichment WHERE fts_procedure_enrichment MATCH 'весы'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(by_tag, 1, "тег должен искаться по колонке tags");
+        // Повторный вызов миграции ничего не ломает.
         migrate_extensions(&conn).unwrap();
     }
 

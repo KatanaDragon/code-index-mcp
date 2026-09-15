@@ -36,13 +36,15 @@ impl IndexTool for SearchTermsTool {
          заполняются механически при индексации: слова имени процедуры \
          (CamelCase-сплит: УточнитьДанныеПоШтрихкоду → уточнить данные по штрихкоду), \
          имя и СИНОНИМ объекта-владельца (русское представление ↔ английский \
-         идентификатор), комментарий над процедурой. КАК СПРАШИВАТЬ: 1-3 ключевых \
+         идентификатор), комментарий над процедурой и метатеги `@tags` (вес выше \
+         прозы), теги шапки модуля. КАК СПРАШИВАТЬ: 1-3 ключевых \
          слова или корень слова — 'штрихкод', 'резерв склад', 'расчет цен'. Слова \
          объединяются по ИЛИ, лучшие совпадения (больше слов совпало) — сверху; НЕ \
          нужно угадывать точную фразу. Словоформы и подстроки от 3 символов работают \
          (триграммы: 'штрихкод' найдёт 'ПоШтрихкоду'), регистр и ё/е не важны. Явный \
          FTS-синтаксис (AND/OR/NOT/\"фраза\") тоже поддержан. Возвращает {proc_key, \
-         terms, score}; proc_key = '<путь>::<имя процедуры>' — тело дальше брать \
+         terms, tags, comment_head (первая строка описания), module_tags, score}; \
+         proc_key = '<путь>::<имя процедуры>' — тело дальше брать \
          через get_function. Точное написание символа известно → \
          get_function/find_symbol; regex по коду → grep_body/grep_code. \
          For BSL/1C repositories only."
@@ -134,24 +136,59 @@ impl IndexTool for SearchTermsTool {
             };
             let conn = storage.conn();
 
-            // FTS5 поиск по terms + JOIN с procedure_enrichment для proc_key,
+            // FTS5 поиск по termам + JOIN с procedure_enrichment для proc_key,
             // signature. Фильтрация по repo идёт ПОСЛЕ FTS-матча (FTS-индекс
             // не разделён по repo — это компромисс: один FTS на всю БД проще
             // в обслуживании, на масштабе УТ ~313к процедур latency
             // ~единицы мс).
             //
-            // ORDER BY rank — стандартное FTS5-ранжирование (BM25). Меньше
-            // — лучше; в выводе отдаём как `score` для прозрачности LLM.
-            let sql = "
-                SELECT pe.proc_key, pe.terms, pe.signature, fts.rank
+            // MATCH по ТАБЛИЦЕ (а не по колонке `terms`) ищет и в прозе, и в
+            // тегах; bm25 с весами ранжирует попадание в тег выше попадания
+            // в прозу. Меньше — лучше; в выводе отдаём как `score` для
+            // прозрачности LLM. `module_tags` — теги шапки модуля этого
+            // proc_key (путь до '::').
+            //
+            // FTS-таблица здесь БЕЗ алиаса: скрытая колонка MATCH и первый
+            // аргумент bm25 зовутся по имени таблицы, под алиасом SQLite их
+            // не находит («no such column: fts»).
+            //
+            // Индекс прежней сборки (одна колонка в FTS, нет колонок разбора
+            // описания) обслуживается прежним запросом: bm25 с двумя весами
+            // на нём падает, а ронять поиск из-за не домигрированной базы
+            // нельзя. Схему догоняет migrate_extensions при открытии базы.
+            let tagged = crate::tools::has_column(conn, "procedure_enrichment", "tags");
+            // Вес тегов — константа сборки, а не вход инструмента: подставляем
+            // в текст запроса (bm25 требует литералы весов, не параметры).
+            let sql = if tagged {
+                format!(
+                    "
+                SELECT pe.proc_key, pe.terms, pe.signature,
+                       bm25(fts_procedure_enrichment, 1.0, {:.1}) AS score,
+                       pe.tags, pe.comment_head,
+                       (SELECT me.tags FROM module_enrichment me
+                         WHERE me.repo = pe.repo
+                           AND me.path = substr(pe.proc_key, 1, instr(pe.proc_key, '::') - 1))
+                FROM fts_procedure_enrichment
+                JOIN procedure_enrichment pe ON pe.id = fts_procedure_enrichment.rowid
+                WHERE pe.repo = ?1 AND fts_procedure_enrichment MATCH ?2
+                ORDER BY score
+                LIMIT ?3
+            ",
+                    crate::terms::TAGS_BM25_WEIGHT
+                )
+            } else {
+                "
+                SELECT pe.proc_key, pe.terms, pe.signature, fts.rank AS score, '', '', ''
                 FROM fts_procedure_enrichment fts
                 JOIN procedure_enrichment pe ON pe.id = fts.rowid
                 WHERE pe.repo = ?1 AND fts.terms MATCH ?2
-                ORDER BY fts.rank
+                ORDER BY score
                 LIMIT ?3
-            ";
+            "
+                .to_string()
+            };
 
-            let mut stmt = match conn.prepare(sql) {
+            let mut stmt = match conn.prepare(&sql) {
                 Ok(s) => s,
                 Err(e) => {
                     return crate::tools::wrap_error(json!({
@@ -159,16 +196,33 @@ impl IndexTool for SearchTermsTool {
                     }))
                 }
             };
+            // Пустые строки полей разбора описания в ответе не показываем:
+            // у LLM-строк обогащения их нет по определению, и null/пустое
+            // поле рядом с termами читается как «данных нет», а не как факт.
+            let non_empty = |s: Option<String>| s.filter(|v| !v.is_empty());
             // Репо-колонка в per-repo БД всегда 'default' (см. index_extras::REPO_DEFAULT);
             // ctx.repo — алиас маршрутизации, в данных его нет (как во всех BSL-tools).
-            let rows_iter = stmt.query_map(params!["default", &fts_query, limit], |r| {
-                Ok(json!({
-                    "proc_key": r.get::<_, String>(0)?,
-                    "terms": r.get::<_, Option<String>>(1)?,
-                    "signature": r.get::<_, Option<String>>(2)?,
-                    "score": r.get::<_, f64>(3)?,
-                }))
-            });
+            let rows_iter = stmt.query_map(
+                params!["default", &fts_query, limit],
+                |r| {
+                    let mut row = json!({
+                        "proc_key": r.get::<_, String>(0)?,
+                        "terms": r.get::<_, Option<String>>(1)?,
+                        "signature": r.get::<_, Option<String>>(2)?,
+                        "score": r.get::<_, f64>(3)?,
+                    });
+                    if let Some(tags) = non_empty(r.get::<_, Option<String>>(4)?) {
+                        row["tags"] = json!(tags);
+                    }
+                    if let Some(head) = non_empty(r.get::<_, Option<String>>(5)?) {
+                        row["comment_head"] = json!(head);
+                    }
+                    if let Some(mtags) = non_empty(r.get::<_, Option<String>>(6)?) {
+                        row["module_tags"] = json!(mtags);
+                    }
+                    Ok(row)
+                },
+            );
 
             // Нечитаемые строки считаем, а не выбрасываем молча: иначе неполная
             // выдача неотличима от честного «столько и нашлось».

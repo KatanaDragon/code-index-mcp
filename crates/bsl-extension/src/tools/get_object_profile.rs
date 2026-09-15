@@ -44,6 +44,8 @@ impl IndexTool for GetObjectProfileTool {
          типам; полный список с object_id/property_id — UUID для dbgs-breakpoints — по \
          expand), data_links (счётчики по видам связи, регистры движений для документов / \
          регистраторы для регистров, число входящих ссылок). \
+         У модулей с шапкой (комментарий в начале .bsl) рядом идут её первая строка \
+         (header) и метатеги @tags — «про что этот модуль» без чтения файла. \
          Отдаёт ОБЗОР: перечни и счётчики, не содержимое. Обработчики конкретной формы \
          — get_form_handlers(owner_full_name, form_name); связи вглубь — get_data_links. \
          expand=['forms.handlers'] вернёт обработчики всех форм, expand=['modules.list'] — \
@@ -422,12 +424,24 @@ fn assemble_profile(
     // тяжелеет так же, как формы. Полный список с UUID — по expand.
     let modules_total = modules.len();
     let mut modules_by_type = serde_json::Map::new();
+    let mut module_tags: Vec<String> = Vec::new();
     for m in &modules {
         let t = m["module_type"].as_str().unwrap_or("?").to_string();
         let n = modules_by_type.get(&t).and_then(|v| v.as_u64()).unwrap_or(0) + 1;
         modules_by_type.insert(t, json!(n));
+        // В свёрнутой карте от шапок остаются только теги: они дёшевы и
+        // отвечают на «про что этот объект», а тексты шапок туда не влезут.
+        for tag in m["tags"].as_str().unwrap_or("").split(',') {
+            let tag = tag.trim();
+            if !tag.is_empty() && !module_tags.iter().any(|t| t == tag) {
+                module_tags.push(tag.to_string());
+            }
+        }
     }
-    let modules_map = json!({ "by_type": Value::Object(modules_by_type.clone()) });
+    let mut modules_map = json!({ "by_type": Value::Object(modules_by_type.clone()) });
+    if !module_tags.is_empty() {
+        modules_map["tags"] = json!(module_tags);
+    }
 
     // Карта форм: имя + число обработчиков. Само содержимое отдаём, только если
     // его попросили явно (expand) либо весь ответ укладывается в бюджет — по
@@ -566,24 +580,52 @@ fn query_forms(conn: &rusqlite::Connection, owner_full_name: &str) -> rusqlite::
     Ok(out)
 }
 
-/// Модули объекта: тип + UUID (object_id/property_id для dbgs) + путь + расширение.
+/// Модули объекта: тип + UUID (object_id/property_id для dbgs) + путь +
+/// расширение + шапка модуля (первая строка и метатеги `@tags`), когда она есть.
 fn query_modules(conn: &rusqlite::Connection, full_name_prefix: &str) -> rusqlite::Result<Vec<Value>> {
     // full_name вида 'Documents.X.ManagerModule' — берём по префиксу 'Documents.X.'.
     let like = format!("{}%", full_name_prefix.replace('%', "\\%").replace('_', "\\_"));
-    let mut stmt = conn.prepare(
-        "SELECT module_type, object_id, property_id, config_version, code_path, extension_name \
-         FROM metadata_modules WHERE repo = ?1 AND full_name LIKE ?2 ESCAPE '\\' \
-         ORDER BY extension_name, module_type",
+    // Шапка (`module_enrichment`) джойнится по пути `.bsl`. Базу прежней
+    // сборки, где таблицы ещё нет, обслуживаем без неё: джойн по
+    // несуществующей таблице уронил бы весь паспорт объекта.
+    let has_headers: i64 = conn.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='module_enrichment'",
+        [],
+        |r| r.get(0),
     )?;
+    let sql = if has_headers > 0 {
+        "SELECT m.module_type, m.object_id, m.property_id, m.config_version, m.code_path, \
+                m.extension_name, me.header, me.tags \
+         FROM metadata_modules m \
+         LEFT JOIN module_enrichment me ON me.repo = m.repo AND me.path = m.code_path \
+         WHERE m.repo = ?1 AND m.full_name LIKE ?2 ESCAPE '\\' \
+         ORDER BY m.extension_name, m.module_type"
+    } else {
+        "SELECT m.module_type, m.object_id, m.property_id, m.config_version, m.code_path, \
+                m.extension_name, NULL, NULL \
+         FROM metadata_modules m \
+         WHERE m.repo = ?1 AND m.full_name LIKE ?2 ESCAPE '\\' \
+         ORDER BY m.extension_name, m.module_type"
+    };
+    let mut stmt = conn.prepare(sql)?;
     let rows = stmt.query_map(params![REPO, like], |r| {
-        Ok(json!({
+        let mut row = json!({
             "module_type": r.get::<_, String>(0)?,
             "object_id": r.get::<_, Option<String>>(1)?,
             "property_id": r.get::<_, Option<String>>(2)?,
             "config_version": r.get::<_, Option<String>>(3)?,
             "code_path": r.get::<_, Option<String>>(4)?,
             "extension_name": r.get::<_, Option<String>>(5)?,
-        }))
+        });
+        // Шапка — только первой строкой: паспорт объекта и так тяжёлая
+        // секция, полный текст берётся через read_file по code_path.
+        if let Some(header) = r.get::<_, Option<String>>(6)?.filter(|s| !s.is_empty()) {
+            row["header"] = json!(crate::terms::head_line(&header));
+        }
+        if let Some(tags) = r.get::<_, Option<String>>(7)?.filter(|s| !s.is_empty()) {
+            row["tags"] = json!(tags);
+        }
+        Ok(row)
     })?;
     let mut out = Vec::new();
     for row in rows {

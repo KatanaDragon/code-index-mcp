@@ -906,6 +906,68 @@ async fn search_terms_respects_limit() {
     assert_eq!(results.len(), 2);
 }
 
+#[tokio::test]
+async fn search_terms_weights_tags_and_returns_comment_head() {
+    // Метатег `@tags` весит в ранжировании больше прозы: процедура, у которой
+    // «весы» стоит тегом, обходит процедуру, у которой это слово лишь в
+    // описании. Рядом с термами возвращаются теги, первая строка описания
+    // и теги шапки модуля.
+    let (_tmp, storage) = fresh_storage();
+    {
+        let s = storage.get().await.unwrap();
+        let conn = s.conn();
+        conn.execute(
+            "INSERT INTO procedure_enrichment \
+             (repo, proc_key, terms, tags, comment_head, comment_len, signature, updated_at) \
+             VALUES (?1, 'CommonModules/КРБ_Весы/Ext/Module.bsl::ПрочитатьНастройки', \
+                     'весы, прочитать настройки, читает настройки службы', 'весы', \
+                     'Читает настройки службы.', 120, 'mech:v2', 0)",
+            params![REPO],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO procedure_enrichment \
+             (repo, proc_key, terms, tags, comment_head, comment_len, signature, updated_at) \
+             VALUES (?1, 'CommonModules/Прочее/Ext/Module.bsl::ОписатьОборудование', \
+                     'описать оборудование, в описании упомянуты весы и другое оборудование', \
+                     '', 'В описании упомянуты весы.', 90, 'mech:v2', 0)",
+            params![REPO],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO module_enrichment (repo, path, header, tags, depends, signature, updated_at) \
+             VALUES (?1, 'CommonModules/КРБ_Весы/Ext/Module.bsl', 'Общий модуль весов.', \
+                     'весы, служба', '', 'mech:v2', 0)",
+            params![REPO],
+        )
+        .unwrap();
+    }
+
+    let res = run_tool(
+        &SearchTermsTool,
+        &storage,
+        serde_json::json!({"repo": REPO, "query": "весы"}),
+    )
+    .await;
+    let results = res["results"].as_array().expect("results — массив");
+    assert_eq!(results.len(), 2, "обе записи содержат «весы»: {results:?}");
+    assert_eq!(
+        results[0]["proc_key"].as_str(),
+        Some("CommonModules/КРБ_Весы/Ext/Module.bsl::ПрочитатьНастройки"),
+        "процедура с тегом должна быть первой: {results:?}"
+    );
+    assert_eq!(results[0]["tags"].as_str(), Some("весы"));
+    assert_eq!(results[0]["comment_head"].as_str(), Some("Читает настройки службы."));
+    assert_eq!(results[0]["module_tags"].as_str(), Some("весы, служба"));
+    // У записи без тегов пустые поля не показываются вовсе.
+    assert!(results[1]["tags"].is_null(), "{:?}", results[1]);
+    assert!(results[1]["module_tags"].is_null(), "{:?}", results[1]);
+    assert_eq!(
+        results[1]["comment_head"].as_str(),
+        Some("В описании упомянуты весы.")
+    );
+}
+
 // ── Привязки обработчиков форм (declarative_callers) ──────────────────────
 //
 // Обработчик формы объявлен в модуле, но в коде его никто не вызывает —

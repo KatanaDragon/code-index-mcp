@@ -78,7 +78,11 @@ impl IndexTool for BslSqlTool {
          metadata_code_usages(object_ref, object_ref_key, member_path, usage_kind, file_path, line; \
          фильтровать по точному object_ref='Document.X' — SQLite lower() НЕ лоуэркейсит кириллицу, \
          object_ref_key уже в нижнем регистре для поиска из приложения), procedure_enrichment(proc_key, \
-         terms, signature), direct_edge_files(caller, callee, source_file). \
+         terms, tags, comment_head, comment_len, signature; tags/comment_* — механический разбор \
+         описания над процедурой, заполнены только у строк signature LIKE 'mech:%'; comment_len = 0 \
+         значит описания над объявлением нет), module_enrichment(path, header, tags, depends; шапка \
+         модуля — комментарий в начале .bsl, path как files.path), \
+         direct_edge_files(caller, callee, source_file). \
          link_kind в data_links: объектные attr/tabular_attr/register_dim/recorder/owner \
          (owner: подчинённый справочник → владелец); \
          конфиг-уровень subsystem_content/exchange_plan_content/defined_type_content/\
@@ -445,12 +449,20 @@ fn terms_fallback_for_sql(
         words.iter().map(|w| format!("\"{}\"", w)).collect::<Vec<_>>().join(" OR ");
     let mut stmt = conn
         .prepare(
-            "SELECT pe.proc_key, pe.signature, fts.rank
-             FROM fts_procedure_enrichment fts
-             JOIN procedure_enrichment pe ON pe.id = fts.rowid
-             WHERE pe.repo = 'default' AND fts.terms MATCH ?1
-             ORDER BY fts.rank
+            // MATCH по таблице (а не по колонке `terms`) ищет и по прозе,
+            // и по метатегам; веса — те же, что у search_terms. Алиаса у
+            // FTS-таблицы нет намеренно: скрытую колонку MATCH и первый
+            // аргумент bm25 SQLite знает только по имени таблицы.
+            &format!(
+                "SELECT pe.proc_key, pe.signature,
+                    bm25(fts_procedure_enrichment, 1.0, {:.1}) AS score
+             FROM fts_procedure_enrichment
+             JOIN procedure_enrichment pe ON pe.id = fts_procedure_enrichment.rowid
+             WHERE pe.repo = 'default' AND fts_procedure_enrichment MATCH ?1
+             ORDER BY score
              LIMIT 10",
+                crate::terms::TAGS_BM25_WEIGHT
+            ),
         )
         .ok()?; // таблиц обогащения нет / старый индекс → молча без fallback
     let rows: Vec<Value> = stmt

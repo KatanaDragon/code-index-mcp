@@ -940,16 +940,126 @@ pub(crate) fn index_object_synonyms(repo_root: &Path, conn: &rusqlite::Connectio
 }
 
 
-/// Полный проход механического обогащения термов (без LLM): для каждой
-/// процедуры из `functions` собрать `terms` (слова имени + слова объекта +
-/// синоним объекта + комментарий над процедурой) и записать в
-/// `procedure_enrichment` с подписью `mech:v1`. Строки с ДРУГОЙ подписью
-/// (LLM-enrich) не трогаются: свои строки предварительно сносятся, вставка —
-/// `ON CONFLICT DO NOTHING`. Комментарии читаются с диска (один read на файл,
-/// файлы сгруппированы по пути). См. `crate::terms`.
+/// Полный проход механического обогащения термов (без LLM): по каждому `.bsl`
+/// репо разобрать шапку модуля и описания процедур, записать шапку в
+/// `module_enrichment`, а термы процедур — в `procedure_enrichment` с подписью
+/// `MECH_SIGNATURE`. Строки с ДРУГОЙ подписью (LLM-enrich) не трогаются: свои
+/// строки предварительно сносятся, вставка — `ON CONFLICT DO NOTHING`. Тексты
+/// читаются с диска (один read на файл). См. `crate::terms`.
 pub(crate) fn index_procedure_terms(repo_root: &Path, conn: &rusqlite::Connection) -> Result<()> {
+    let filled = rebuild_procedure_terms_with(conn, |rel| {
+        std::fs::read_to_string(repo_root.join(rel.replace('\\', "/")))
+            .map(|c| c.lines().map(String::from).collect())
+            .unwrap_or_default()
+    })?;
+
+    code_index_core::logging::stage_detail(code_index_core::logging::plural(
+        filled as u64,
+        "процедура",
+        "процедуры",
+        "процедур",
+    ));
+    tracing::info!("procedure_terms: механически обогащено {} процедур", filled);
+    Ok(())
+}
+
+
+/// Тот же терм-проход, но текст модулей берётся не с диска, а из сохранённого
+/// в базе содержимого файлов (`file_contents`, zstd). Нужен миграции
+/// `migrate_extensions`: при смене подписи термов пересобрать надо ТОЛЬКО слой
+/// термов, корня репо у миграции нет, а второй обход диска ей не нужен.
+/// Возвращает число записанных процедур.
+pub(crate) fn rebuild_procedure_terms_from_db(conn: &rusqlite::Connection) -> Result<usize> {
+    let mut missing: usize = 0;
+    let filled = rebuild_procedure_terms_with(conn, |rel| {
+        match read_module_lines_from_db(conn, rel) {
+            Some(lines) => lines,
+            None => {
+                // Текста нет — oversize-файл или индекс, собранный до появления
+                // file_contents. Термы соберутся без описания (имя + объект +
+                // синоним), полный текст вернёт следующая индексация с диска.
+                missing += 1;
+                Vec::new()
+            }
+        }
+    })?;
+    if missing > 0 {
+        tracing::warn!(
+            "термы процедур: у {} модулей в базе нет сохранённого текста \
+             (oversize или индекс старой версии) — описания и шапки у них не восстановлены",
+            missing
+        );
+    }
+    Ok(filled)
+}
+
+
+/// Разжать текст `.bsl` из `file_contents` по repo-relative пути.
+/// `None` — записи нет, файл oversize или blob повреждён.
+fn read_module_lines_from_db(conn: &rusqlite::Connection, rel: &str) -> Option<Vec<String>> {
+    use rusqlite::OptionalExtension;
+    use std::io::Read;
+
+    /// Потолок разжатого модуля — как у core (защита от zstd-bomb в
+    /// повреждённой базе); любой реальный .bsl многократно меньше.
+    const MAX_DECOMPRESSED: u64 = 256 * 1024 * 1024;
+
+    let blob: Vec<u8> = conn
+        .query_row(
+            "SELECT fc.content_blob FROM file_contents fc \
+             JOIN files f ON f.id = fc.file_id WHERE f.path = ?1",
+            params![rel],
+            |r| r.get::<_, Option<Vec<u8>>>(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .flatten()?;
+    let mut decoder = zstd::stream::read::Decoder::new(&blob[..]).ok()?;
+    let mut out = Vec::new();
+    let read = (&mut decoder).take(MAX_DECOMPRESSED + 1).read_to_end(&mut out).ok()?;
+    if read as u64 > MAX_DECOMPRESSED {
+        return None;
+    }
+    let text = String::from_utf8(out).ok()?;
+    Some(text.lines().map(String::from).collect())
+}
+
+
+/// Массовая вставка термов со снятыми FTS-триггерами: триграммный токенайзер
+/// срабатывал бы построчно на сотнях тысяч строк (доминирующая стоимость
+/// слоя), а один `rebuild` перестраивает индекс целиком за проход. Триггеры
+/// возвращаются ВСЕГДА, даже если тело упало, — иначе инкрементальный путь
+/// после сброса на диск потеряет синхронизацию FTS.
+fn with_fts_bulk<T>(
+    conn: &rusqlite::Connection,
+    body: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    conn.execute_batch(crate::schema::PE_FTS_TRIGGERS_DROP)?;
+    let result = body();
+    let rebuilt = conn
+        .execute_batch("INSERT INTO fts_procedure_enrichment(fts_procedure_enrichment) VALUES('rebuild');")
+        .map_err(anyhow::Error::from);
+    let recreated = conn
+        .execute_batch(crate::schema::PE_FTS_TRIGGERS_DDL)
+        .map_err(anyhow::Error::from);
+    // Ошибка тела важнее ошибок восстановления, поэтому она идёт первой.
+    result.and_then(|v| rebuilt.and(recreated).map(|_| v))
+}
+
+
+/// Общий проход сборки механических термов: пройти все `.bsl` репо, разобрать
+/// шапку модуля и описания процедур, переписать `module_enrichment` и свои
+/// (`mech:%`) строки `procedure_enrichment`. Текст файла даёт `lines_of` —
+/// диск при индексации, `file_contents` при терм-проходе миграции.
+/// Возвращает число записанных процедур.
+fn rebuild_procedure_terms_with<F>(conn: &rusqlite::Connection, mut lines_of: F) -> Result<usize>
+where
+    F: FnMut(&str) -> Vec<String>,
+{
     use crate::terms::{
-        build_terms, extract_leading_comment, object_from_module_path, MECH_SIGNATURE,
+        build_terms, extract_leading_comment, extract_module_header, object_from_module_path,
+        MECH_SIGNATURE,
     };
 
     // Синонимы объектов: full_name → synonym (один SELECT на репо).
@@ -967,8 +1077,11 @@ pub(crate) fn index_procedure_terms(repo_root: &Path, conn: &rusqlite::Connectio
         }
     }
 
-    // Все BSL-процедуры, сгруппированные по файлу (ORDER BY path).
-    let procs: Vec<(String, String, i64)> = {
+    // Процедуры, сгруппированные по файлу. Обход ведётся по файлам, а не по
+    // процедурам: шапка есть и у модуля без единой процедуры.
+    let mut procs_by_path: std::collections::HashMap<String, Vec<(String, i64)>> =
+        std::collections::HashMap::new();
+    {
         let mut stmt = conn.prepare(
             "SELECT fl.path, f.name, COALESCE(f.line_start, 0) FROM functions f \
              JOIN files fl ON fl.id = f.file_id \
@@ -977,6 +1090,15 @@ pub(crate) fn index_procedure_terms(repo_root: &Path, conn: &rusqlite::Connectio
         let rows = stmt.query_map([], |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
         })?;
+        for (path, name, line_start) in rows.flatten() {
+            procs_by_path.entry(path).or_default().push((name, line_start));
+        }
+    }
+
+    let files: Vec<String> = {
+        let mut stmt =
+            conn.prepare("SELECT path FROM files WHERE path LIKE '%.bsl' ORDER BY path")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
         rows.flatten().collect()
     };
 
@@ -985,74 +1107,95 @@ pub(crate) fn index_procedure_terms(repo_root: &Path, conn: &rusqlite::Connectio
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
 
-    let _ = conn.execute("ROLLBACK", []); // защита от cascade-ошибки
-    conn.execute("BEGIN", [])?;
-    conn.execute(
-        "DELETE FROM procedure_enrichment WHERE repo = ?1 AND signature LIKE 'mech:%'",
-        params![REPO_DEFAULT],
-    )?;
-    let mut ins = conn.prepare(
-        "INSERT INTO procedure_enrichment (repo, proc_key, terms, signature, updated_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(repo, proc_key) DO NOTHING",
-    )?;
-
-    let mut cur_path = String::new();
-    let mut lines: Vec<String> = Vec::new();
-    let mut filled = 0usize;
-    for (path, name, line_start) in &procs {
-        if *path != cur_path {
-            cur_path = path.clone();
-            lines = std::fs::read_to_string(repo_root.join(path.replace('\\', "/")))
-                .map(|c| c.lines().map(String::from).collect())
-                .unwrap_or_default();
+    with_fts_bulk(conn, || {
+        let _ = conn.execute("ROLLBACK", []); // защита от cascade-ошибки
+        conn.execute("BEGIN", [])?;
+        conn.execute(
+            "DELETE FROM procedure_enrichment WHERE repo = ?1 AND signature LIKE 'mech:%'",
+            params![REPO_DEFAULT],
+        )?;
+        // Шапки модулей заполняет только механика — своей подписи для
+        // выборочного удаления не требуется.
+        conn.execute("DELETE FROM module_enrichment WHERE repo = ?1", params![REPO_DEFAULT])?;
+        let mut filled = 0usize;
+        {
+            let mut ins_proc = conn.prepare(
+                "INSERT INTO procedure_enrichment \
+                 (repo, proc_key, terms, tags, comment_head, comment_len, signature, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) ON CONFLICT(repo, proc_key) DO NOTHING",
+            )?;
+            let mut ins_mod = conn.prepare(
+                "INSERT INTO module_enrichment \
+                 (repo, path, header, tags, depends, signature, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+                 ON CONFLICT(repo, path) DO UPDATE SET \
+                   header = excluded.header, tags = excluded.tags, \
+                   depends = excluded.depends, signature = excluded.signature, \
+                   updated_at = excluded.updated_at",
+            )?;
+            for path in &files {
+                let procs = procs_by_path.get(path);
+                let lines = lines_of(path);
+                let header = extract_module_header(&lines);
+                let module_tags: Vec<String> =
+                    header.as_ref().map(|h| h.tags.clone()).unwrap_or_default();
+                if let Some(h) = &header {
+                    ins_mod.execute(params![
+                        REPO_DEFAULT,
+                        path,
+                        &h.prose,
+                        h.tags_line(),
+                        h.depends_line(),
+                        MECH_SIGNATURE,
+                        now
+                    ])?;
+                }
+                let Some(procs) = procs else { continue };
+                let object = object_from_module_path(path);
+                let synonym = object
+                    .as_ref()
+                    .and_then(|(mt, nm)| syn.get(&format!("{}.{}", mt, nm)))
+                    .map(String::as_str);
+                for (name, line_start) in procs {
+                    let comment = extract_leading_comment(&lines, (*line_start).max(0) as usize);
+                    let terms = build_terms(
+                        name,
+                        object.as_ref().map(|(_, nm)| nm.as_str()),
+                        synonym,
+                        comment.as_ref(),
+                        &module_tags,
+                    );
+                    if terms.is_empty() {
+                        continue;
+                    }
+                    let proc_key = format!("{}::{}", path, name);
+                    filled += ins_proc.execute(params![
+                        REPO_DEFAULT,
+                        proc_key,
+                        terms,
+                        comment.as_ref().map(|c| c.tags_line()).unwrap_or_default(),
+                        comment.as_ref().map(|c| c.head.clone()).unwrap_or_default(),
+                        comment.as_ref().map(|c| c.len_chars as i64).unwrap_or(0),
+                        MECH_SIGNATURE,
+                        now
+                    ])?;
+                }
+            }
         }
-        let comment = extract_leading_comment(&lines, (*line_start).max(0) as usize);
-        let object = object_from_module_path(path);
-        let synonym = object
-            .as_ref()
-            .and_then(|(mt, nm)| syn.get(&format!("{}.{}", mt, nm)))
-            .map(String::as_str);
-        let terms = build_terms(
-            name,
-            object.as_ref().map(|(_, nm)| nm.as_str()),
-            synonym,
-            comment.as_deref(),
-        );
-        if terms.is_empty() {
-            continue;
-        }
-        let proc_key = format!("{}::{}", path, name);
-        filled += ins.execute(params![REPO_DEFAULT, proc_key, terms, MECH_SIGNATURE, now])?;
-    }
-    drop(ins);
-    conn.execute("COMMIT", [])?;
-
-    code_index_core::logging::stage_detail(code_index_core::logging::plural(
-        filled as u64,
-        "процедура",
-        "процедуры",
-        "процедур",
-    ));
-    tracing::info!("procedure_terms: механически обогащено {} процедур", filled);
-    Ok(())
+        conn.execute("COMMIT", [])?;
+        Ok(filled)
+    })
 }
 
 
-/// Сборка механических термов из staging (`_proc_terms_staging`, наполнен
-/// parse-collector'ом в фазе параллельного парсинга) — БЕЗ повторного чтения
-/// .bsl с диска. Синоним объекта подставляется по metadata_objects (синонимы
-/// заполнены XML-слоем, идущим ДО этого шага). В конце staging дропается.
+/// Сборка механических термов из staging (`_proc_terms_staging` и
+/// `_module_header_staging`, наполнены parse-collector'ом в фазе параллельного
+/// парсинга) — БЕЗ повторного чтения .bsl с диска. Синоним объекта
+/// подставляется по metadata_objects (синонимы заполнены XML-слоем, идущим ДО
+/// этого шага). В конце staging дропается.
 pub(crate) fn build_procedure_terms_from_staging(conn: &rusqlite::Connection) -> Result<()> {
-    // Bulk-пересборка полнотекста: снимаем FTS-триггеры procedure_enrichment
-    // на время массовой вставки (иначе триграммный токенайзер срабатывает
-    // построчно на ~530k строк — доминирующая стоимость слоя). После вставки
-    // один INSERT ... VALUES('rebuild') перестраивает FTS целиком за проход.
-    // Триггеры возвращаем ВСЕГДА (даже при ошибке тела) — иначе после flush
-    // на диск инкрементальный путь потеряет синхронизацию FTS.
-    conn.execute_batch("DROP TRIGGER IF EXISTS pe_fts_insert; DROP TRIGGER IF EXISTS pe_fts_delete; DROP TRIGGER IF EXISTS pe_fts_update;")?;
-
-    let body = || -> Result<()> {
-        use crate::terms::{build_terms, MECH_SIGNATURE};
+    with_fts_bulk(conn, || {
+        use crate::terms::{build_terms, LeadingComment, MECH_SIGNATURE};
 
         let mut syn: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         {
@@ -1065,15 +1208,46 @@ pub(crate) fn build_procedure_terms_from_staging(conn: &rusqlite::Connection) ->
             }
         }
 
-        let staged: Vec<(String, String, Option<String>, Option<String>, Option<String>)> = {
-            let mut stmt = conn.prepare("SELECT proc_key, proc_name, object_meta_type, object_name, comment FROM _proc_terms_staging")?;
+        // Шапки модулей: путь → (проза, теги, зависимости). Теги отсюда идут
+        // в термы процедур этого же файла.
+        let headers: Vec<(String, String, String, String)> = {
+            let mut stmt = conn.prepare(
+                "SELECT path, header, tags, depends FROM _module_header_staging",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                ))
+            })?;
+            rows.flatten().collect()
+        };
+        let module_tags: std::collections::HashMap<String, Vec<String>> = headers
+            .iter()
+            .map(|(path, _, tags, _)| {
+                let list: Vec<String> = tags
+                    .split(',')
+                    .map(|t| t.trim().to_string())
+                    .filter(|t| !t.is_empty())
+                    .collect();
+                (path.clone(), list)
+            })
+            .collect();
+
+        let staged: Vec<(String, String, Option<String>, Option<String>, String, String, String, i64)> = {
+            let mut stmt = conn.prepare("SELECT proc_key, proc_name, object_meta_type, object_name, comment_prose, comment_head, comment_tags, comment_len FROM _proc_terms_staging")?;
             let rows = stmt.query_map([], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, String>(1)?,
                     r.get::<_, Option<String>>(2)?,
                     r.get::<_, Option<String>>(3)?,
-                    r.get::<_, Option<String>>(4)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, String>(5)?,
+                    r.get::<_, String>(6)?,
+                    r.get::<_, i64>(7)?,
                 ))
             })?;
             rows.flatten().collect()
@@ -1087,26 +1261,78 @@ pub(crate) fn build_procedure_terms_from_staging(conn: &rusqlite::Connection) ->
         let _ = conn.execute("ROLLBACK", []); // защита от cascade-ошибки
         conn.execute("BEGIN", [])?;
         conn.execute("DELETE FROM procedure_enrichment WHERE repo = ?1 AND signature LIKE 'mech:%'", params![REPO_DEFAULT])?;
+        conn.execute("DELETE FROM module_enrichment WHERE repo = ?1", params![REPO_DEFAULT])?;
         let mut filled = 0usize;
         {
-            let mut ins = conn.prepare("INSERT INTO procedure_enrichment (repo, proc_key, terms, signature, updated_at) VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(repo, proc_key) DO NOTHING")?;
-            for (proc_key, proc_name, object_meta_type, object_name, comment) in &staged {
+            let mut ins_mod = conn.prepare(
+                "INSERT INTO module_enrichment (repo, path, header, tags, depends, signature, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) ON CONFLICT(repo, path) DO UPDATE SET \
+                   header = excluded.header, tags = excluded.tags, depends = excluded.depends, \
+                   signature = excluded.signature, updated_at = excluded.updated_at",
+            )?;
+            for (path, header, tags, depends) in &headers {
+                ins_mod.execute(params![
+                    REPO_DEFAULT, path, header, tags, depends, MECH_SIGNATURE, now
+                ])?;
+            }
+        }
+        {
+            let mut ins = conn.prepare(
+                "INSERT INTO procedure_enrichment \
+                 (repo, proc_key, terms, tags, comment_head, comment_len, signature, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) ON CONFLICT(repo, proc_key) DO NOTHING",
+            )?;
+            for (proc_key, proc_name, object_meta_type, object_name, prose, head, tags, len_chars)
+                in &staged
+            {
                 let synonym = match (object_meta_type, object_name) {
                     (Some(mt), Some(nm)) => syn.get(&format!("{}.{}", mt, nm)).map(String::as_str),
                     _ => None,
                 };
-                let terms = build_terms(proc_name, object_name.as_deref(), synonym, comment.as_deref());
+                // Разбор описания сделан в фазе парсинга — здесь собираем
+                // структуру обратно из колонок staging (@depends в термы не
+                // идёт, поэтому в staging его и нет).
+                let comment = LeadingComment {
+                    prose: prose.clone(),
+                    head: head.clone(),
+                    tags: tags
+                        .split(',')
+                        .map(|t| t.trim().to_string())
+                        .filter(|t| !t.is_empty())
+                        .collect(),
+                    depends: Vec::new(),
+                    len_chars: (*len_chars).max(0) as usize,
+                };
+                let has_comment = *len_chars > 0;
+                let path = proc_key.split("::").next().unwrap_or_default();
+                let mtags = module_tags.get(path).cloned().unwrap_or_default();
+                let terms = build_terms(
+                    proc_name,
+                    object_name.as_deref(),
+                    synonym,
+                    has_comment.then_some(&comment),
+                    &mtags,
+                );
                 if terms.is_empty() {
                     continue;
                 }
-                filled += ins.execute(params![REPO_DEFAULT, proc_key, terms, MECH_SIGNATURE, now])?;
+                filled += ins.execute(params![
+                    REPO_DEFAULT,
+                    proc_key,
+                    terms,
+                    comment.tags_line(),
+                    &comment.head,
+                    *len_chars,
+                    MECH_SIGNATURE,
+                    now
+                ])?;
             }
         }
         conn.execute("COMMIT", [])?;
 
-        // FTS сняли с триггеров — перестраиваем полнотекст целиком из content-таблицы.
-        conn.execute_batch("INSERT INTO fts_procedure_enrichment(fts_procedure_enrichment) VALUES('rebuild');")?;
-        conn.execute_batch("DROP TABLE IF EXISTS _proc_terms_staging;")?;
+        conn.execute_batch(
+            "DROP TABLE IF EXISTS _proc_terms_staging; DROP TABLE IF EXISTS _module_header_staging;",
+        )?;
 
         code_index_core::logging::stage_detail(code_index_core::logging::plural(
             filled as u64,
@@ -1114,16 +1340,13 @@ pub(crate) fn build_procedure_terms_from_staging(conn: &rusqlite::Connection) ->
             "процедуры",
             "процедур",
         ));
-        tracing::info!("procedure_terms (staging): механически обогащено {} процедур", filled);
+        tracing::info!(
+            "procedure_terms (staging): механически обогащено {} процедур, шапок модулей {}",
+            filled,
+            headers.len()
+        );
         Ok(())
-    };
-
-    let result = body();
-    // Вернуть FTS-триггеры при любом исходе тела.
-    let recreated = conn
-        .execute_batch(crate::schema::PE_FTS_TRIGGERS_DDL)
-        .map_err(anyhow::Error::from);
-    result.and(recreated)
+    })
 }
 
 

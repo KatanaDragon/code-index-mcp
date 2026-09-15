@@ -111,6 +111,21 @@ pub(crate) fn wrap_error(error_value: Value) -> Value {
     wrap_with_meta_structural(error_value, Vec::new(), false)
 }
 
+/// Есть ли колонка в таблице (одна PRAGMA). Инструменты, читающие колонки
+/// свежих миграций, обслуживают и базу прежней сборки: схему догоняет
+/// `migrate_extensions` при открытии базы, но до него ронять выдачу из-за
+/// отсутствующей колонки нельзя.
+pub(crate) fn has_column(conn: &rusqlite::Connection, table: &str, column: &str) -> bool {
+    let Ok(mut stmt) = conn.prepare(&format!("PRAGMA table_info(\"{}\")", table)) else {
+        return false;
+    };
+    let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(1)) else {
+        return false;
+    };
+    let found = rows.filter_map(Result::ok).any(|name| name == column);
+    found
+}
+
 /// Имя объекта для single-object инструмента — берётся ЗНАЧЕНИЕ без оглядки на имя
 /// ключа. Агент мог назвать параметр `object`/`full_name`/`name`/как угодно — не
 /// важно: у такого инструмента ровно один объект, поэтому имя ключа не анализируем.
