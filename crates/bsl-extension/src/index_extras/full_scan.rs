@@ -1037,6 +1037,12 @@ fn with_fts_bulk<T>(
 ) -> Result<T> {
     conn.execute_batch(crate::schema::PE_FTS_TRIGGERS_DROP)?;
     let result = body();
+    if result.is_err() {
+        // Тело упало посреди своей транзакции — закрываем её ДО пересборки
+        // индекса, иначе rebuild и восстановленные триггеры оказались бы
+        // внутри незакрытой транзакции и откатились бы вместе с ней.
+        let _ = conn.execute("ROLLBACK", []);
+    }
     let rebuilt = conn
         .execute_batch("INSERT INTO fts_procedure_enrichment(fts_procedure_enrichment) VALUES('rebuild');")
         .map_err(anyhow::Error::from);
