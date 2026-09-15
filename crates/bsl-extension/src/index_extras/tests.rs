@@ -1524,7 +1524,7 @@ fn signature_change_triggers_terms_rebuild_from_db() {
     let tmp = TempDir::new().unwrap();
     let repo = tmp.path().join("repo");
     std::fs::create_dir(&repo).unwrap();
-    let mut storage = fresh_storage(&tmp);
+    let storage = fresh_storage(&tmp);
     write_header_fixture(&repo, &storage);
     let content = std::fs::read_to_string(
         repo.join("CommonModules")
