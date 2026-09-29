@@ -657,12 +657,18 @@ pub fn run_worker(
         }
     };
 
-    // 1. Открыть/создать .code-index/index.db
-    let db_dir = path.join(".code-index");
+    // 1. Открыть/создать индекс по настройке этого пути.
+    let db_dir = match crate::index_location::directory_for_entry(&entry) {
+        Ok(dir) => dir,
+        Err(e) => {
+            tokio_block_on(async { state.set_error(&path, e.to_string()).await });
+            return;
+        }
+    };
     if let Err(e) = std::fs::create_dir_all(&db_dir) {
         tokio_block_on(async {
             state
-                .set_error(&path, format!("Создание .code-index/: {}", e))
+                .set_error(&path, format!("Создание каталога индекса {}: {}", db_dir.display(), e))
                 .await;
         });
         return;
@@ -670,7 +676,7 @@ pub fn run_worker(
     let db_path = db_dir.join("index.db");
 
     // 2. Загрузить конфигурацию проекта (для exclude_dirs, debounce и т.п.)
-    let mut index_config = match IndexConfig::load(&path) {
+    let mut index_config = match IndexConfig::load_from_dir(&db_dir) {
         Ok(c) => c,
         Err(e) => {
             tokio_block_on(async {

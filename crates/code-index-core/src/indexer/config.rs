@@ -289,7 +289,11 @@ impl IndexConfig {
     /// Загрузить конфигурацию из .code-index/config.json.
     /// Если файл не существует — вернуть конфиг по умолчанию.
     pub fn load(project_root: &Path) -> Result<Self> {
-        let config_path = project_root.join(".code-index").join("config.json");
+        Self::load_from_dir(&project_root.join(".code-index"))
+    }
+
+    pub fn load_from_dir(index_dir: &Path) -> Result<Self> {
+        let config_path = index_dir.join("config.json");
         if config_path.exists() {
             let content = std::fs::read_to_string(&config_path)?;
             let config: IndexConfig = serde_json::from_str(&content)?;
@@ -301,7 +305,10 @@ impl IndexConfig {
 
     /// Сохранить конфигурацию (для создания дефолтного файла)
     pub fn save(&self, project_root: &Path) -> Result<()> {
-        let config_dir = project_root.join(".code-index");
+        self.save_to_dir(&project_root.join(".code-index"))
+    }
+
+    pub fn save_to_dir(&self, config_dir: &Path) -> Result<()> {
         std::fs::create_dir_all(&config_dir)?;
         let config_path = config_dir.join("config.json");
         let content = serde_json::to_string_pretty(self)?;

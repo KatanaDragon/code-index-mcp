@@ -868,3 +868,26 @@ MIT. См. [LICENSE](LICENSE).
 - [rusqlite](https://github.com/rusqlite/rusqlite) — SQLite для Rust
 - [rayon](https://github.com/rayon-rs/rayon) — параллелизм данных без лишних усилий
 - [rmcp](https://github.com/modelcontextprotocol/rust-sdk) — Rust MCP SDK
+# Хранение индекса вне исходников
+
+В `daemon.toml` для каждого `[[paths]]` можно указать абсолютный `index_dir` — каталог
+с `index.db`, журналами SQLite, `index.lock` и `config.json`:
+
+```toml
+[[paths]]
+path = "C:/Rusin/ka-upr/src/cf"
+alias = "ka_cf"
+language = "bsl"
+index_dir = "C:/Rusin/1c-agent-contour/.local/code-index/indexes/0a169de4c600c08a"
+```
+
+Без `index_dir` сохраняется прежнее расположение `<path>/.code-index`.
+`serve --path`, команды CLI и демон читают один `daemon.toml` через `CODE_INDEX_HOME`;
+при `serve --config` используется указанный файл. Путь, который выберет CLI,
+показывает `bsl-indexer index-location --path <path>`.
+
+Перед включением `index_dir` перенесите **весь** старый каталог `.code-index`
+при остановленном демоне и закрытом `serve`. Если старый каталог остался, новый
+бинарник откажется открывать индекс и не создаст пустую базу. Для контура 1С
+перенос выполняет `install/migrate_code_index.py --repo <repo> --check`, затем
+`--apply --source <новый bsl-indexer.exe>`.

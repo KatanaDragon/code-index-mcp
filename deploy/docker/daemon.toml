@@ -22,3 +22,6 @@ language = "bsl"
 # path = "/repos/mcp_tools"
 # alias = "mcp_tools"
 # language = "bsl"
+# Для хранения базы вне индексируемого дерева добавьте в соответствующий [[paths]]:
+# index_dir = "/var/lib/code-index/indexes/project-id"
+# Перенесите туда весь прежний .code-index до запуска демона.

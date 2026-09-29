@@ -470,6 +470,10 @@ pub struct PathEntry {
     /// демон работает как системный процесс без предсказуемого cwd.
     pub path: PathBuf,
 
+    /// Каталог базы индекса. None сохраняет прежний путь `<path>/.code-index`.
+    #[serde(default)]
+    pub index_dir: Option<PathBuf>,
+
     /// Переопределение debounce для этой папки. `None` — использовать
     /// значение из `.code-index/config.json` проекта.
     #[serde(default)]
@@ -551,8 +555,10 @@ pub fn load_from(path: &Path) -> anyhow::Result<DaemonFileConfig> {
 
 /// Разобрать конфиг из строки. Используется в тестах.
 pub fn parse_str(text: &str) -> anyhow::Result<DaemonFileConfig> {
-    toml::from_str(text)
-        .map_err(|e| anyhow::anyhow!("Ошибка парсинга daemon.toml: {}", e))
+    let cfg: DaemonFileConfig = toml::from_str(text)
+        .map_err(|e| anyhow::anyhow!("Ошибка парсинга daemon.toml: {}", e))?;
+    crate::index_location::validate_entries(&cfg.paths)?;
+    Ok(cfg)
 }
 
 /// Загрузить конфиг по пути `$CODE_INDEX_HOME/daemon.toml`. Если файла нет —
@@ -625,6 +631,7 @@ mod tests {
     fn effective_alias_normalizes_spaces() {
         let entry = PathEntry {
             path: PathBuf::from("C:/Some Folder Name"),
+            index_dir: None,
             debounce_ms: None,
             batch_ms: None,
             alias: None,
@@ -719,6 +726,7 @@ mod tests {
         // 1. Если задан per-path — он побеждает.
         let entry_with_override = PathEntry {
             path: PathBuf::from("/x"),
+            index_dir: None,
             debounce_ms: None,
             batch_ms: None,
             alias: None,
@@ -740,6 +748,7 @@ mod tests {
         // 2. Per-path не задан — берётся глобальный.
         let entry_no_override = PathEntry {
             path: PathBuf::from("/x"),
+            index_dir: None,
             debounce_ms: None,
             batch_ms: None,
             alias: None,

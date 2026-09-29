@@ -23,6 +23,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Показать каталог индекса для пути, не создавая файлов.
+    IndexLocation {
+        #[arg(long)]
+        path: String,
+    },
     /// Запустить MCP-сервер (read-only). Индексацию ведёт отдельный демон;
     /// этот режим используется Claude Code и другими клиентами как MCP-транспорт.
     ///
@@ -316,11 +321,11 @@ enum DaemonAction {
 }
 
 /// Получить путь к БД для проекта
-fn get_db_path(project_path: &str) -> PathBuf {
+fn get_db_path(project_path: &str) -> anyhow::Result<PathBuf> {
     let root = Path::new(project_path)
         .canonicalize()
         .unwrap_or_else(|_| PathBuf::from(project_path));
-    root.join(".code-index").join("index.db")
+    crate::index_location::db_for_path(&root, None)
 }
 
 /// Собрать список (alias, root, db_path) для MCP-сервера.
@@ -385,7 +390,7 @@ fn build_repo_entries(
         let root = Path::new(&dir)
             .canonicalize()
             .unwrap_or_else(|_| PathBuf::from(&dir));
-        let db_path = root.join(".code-index").join("index.db");
+        let db_path = crate::index_location::db_for_path(&root, config_path)?;
 
         // Если БД ещё нет — создаём пустую со схемой, чтобы сервер мог стартовать.
         // Данные появятся, когда демон проиндексирует путь.
@@ -617,6 +622,10 @@ pub async fn run(registry: ProcessorRegistry) -> anyhow::Result<()> {
     let mut registry = Some(registry);
 
     match cli.command {
+        Commands::IndexLocation { path } => {
+            let root = Path::new(&path).canonicalize().unwrap_or_else(|_| PathBuf::from(path));
+            println!("{}", crate::index_location::directory_for_path(&root, None)?.display());
+        }
         Commands::Serve { path, transport, host, port, config, serve_config } => {
             cmd_serve(path, transport, host, port, config, serve_config, registry).await?;
         }
@@ -647,49 +656,49 @@ pub async fn run(registry: ProcessorRegistry) -> anyhow::Result<()> {
         // ── Новые команды: JSON-вывод ─────────────────────────────────────────
 
         Commands::SearchFunction { query, path, language, limit } => {
-            let db_path = get_db_path(&path);
+            let db_path = get_db_path(&path)?;
             let storage = Storage::open_file_readonly(&db_path)?;
             let results = storage.search_functions(&query, limit, language.as_deref())?;
             println!("{}", serde_json::to_string_pretty(&results)?);
         }
 
         Commands::SearchClass { query, path, language, limit } => {
-            let db_path = get_db_path(&path);
+            let db_path = get_db_path(&path)?;
             let storage = Storage::open_file_readonly(&db_path)?;
             let results = storage.search_classes(&query, limit, language.as_deref())?;
             println!("{}", serde_json::to_string_pretty(&results)?);
         }
 
         Commands::GetFunction { name, path, language: _ } => {
-            let db_path = get_db_path(&path);
+            let db_path = get_db_path(&path)?;
             let storage = Storage::open_file_readonly(&db_path)?;
             let results = storage.get_function_by_name(&name)?;
             println!("{}", serde_json::to_string_pretty(&results)?);
         }
 
         Commands::GetClass { name, path, language: _ } => {
-            let db_path = get_db_path(&path);
+            let db_path = get_db_path(&path)?;
             let storage = Storage::open_file_readonly(&db_path)?;
             let results = storage.get_class_by_name(&name)?;
             println!("{}", serde_json::to_string_pretty(&results)?);
         }
 
         Commands::GetCallers { function_name, path, language } => {
-            let db_path = get_db_path(&path);
+            let db_path = get_db_path(&path)?;
             let storage = Storage::open_file_readonly(&db_path)?;
             let results = storage.get_callers(&function_name, language.as_deref())?;
             println!("{}", serde_json::to_string_pretty(&results)?);
         }
 
         Commands::GetCallees { function_name, path, language } => {
-            let db_path = get_db_path(&path);
+            let db_path = get_db_path(&path)?;
             let storage = Storage::open_file_readonly(&db_path)?;
             let results = storage.get_callees(&function_name, language.as_deref())?;
             println!("{}", serde_json::to_string_pretty(&results)?);
         }
 
         Commands::GetImports { path, file_id, module, language } => {
-            let db_path = get_db_path(&path);
+            let db_path = get_db_path(&path)?;
             let storage = Storage::open_file_readonly(&db_path)?;
 
             // Приоритет: file_id > module; если ничего не указано — ошибка
@@ -706,14 +715,14 @@ pub async fn run(registry: ProcessorRegistry) -> anyhow::Result<()> {
         }
 
         Commands::GetFileSummary { file, path } => {
-            let db_path = get_db_path(&path);
+            let db_path = get_db_path(&path)?;
             let storage = Storage::open_file_readonly(&db_path)?;
             let result = storage.get_file_summary(&file)?;
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
 
         Commands::SearchText { query, path, language, limit } => {
-            let db_path = get_db_path(&path);
+            let db_path = get_db_path(&path)?;
             let storage = Storage::open_file_readonly(&db_path)?;
             let results = storage.search_text(&query, limit, language.as_deref())?;
 
@@ -737,7 +746,7 @@ pub async fn run(registry: ProcessorRegistry) -> anyhow::Result<()> {
                     "Укажите --pattern <подстрока> или --regex <выражение>"
                 ));
             }
-            let db_path = get_db_path(&path);
+            let db_path = get_db_path(&path)?;
             let storage = Storage::open_file_readonly(&db_path)?;
             let results = storage.grep_body(
                 pattern.as_deref(),
@@ -810,11 +819,7 @@ async fn cmd_serve(
         // Создать пустые БД для local-репо, чтобы сервер мог открыть
         // их read-only до индексации демоном.
         for daemon_entry in &daemon_cfg.paths {
-            let root = daemon_entry
-                .path
-                .canonicalize()
-                .unwrap_or_else(|_| daemon_entry.path.clone());
-            let db_path = root.join(".code-index").join("index.db");
+            let db_path = crate::index_location::directory_for_entry(daemon_entry)?.join("index.db");
             if !db_path.exists() {
                 std::fs::create_dir_all(db_path.parent().unwrap())?;
                 let storage = Storage::open_file(&db_path)?;
@@ -1047,14 +1052,14 @@ fn cmd_index(
         .canonicalize()
         .unwrap_or_else(|_| PathBuf::from(&path));
 
-    // 2. Создать директорию .code-index/ внутри проекта
-    let db_dir = abs_path.join(".code-index");
+    // 2. Создать выбранный каталог индекса.
+    let db_dir = crate::index_location::directory_for_path(&abs_path, None)?;
     std::fs::create_dir_all(&db_dir)
         .map_err(|e| anyhow::anyhow!("Не удалось создать директорию {:?}: {}", db_dir, e))?;
 
     // 3. Загрузить конфигурацию проекта
     let db_path = db_dir.join("index.db");
-    let mut config = IndexConfig::load(&abs_path)?;
+    let mut config = IndexConfig::load_from_dir(&db_dir)?;
     // Язык репозитория нужен для неоднозначных расширений (`.h` —
     // заголовок C или C++). У демона он берётся из `[[paths]] language`;
     // здесь конфига демона нет, поэтому определяем сами — тем же
@@ -1251,7 +1256,7 @@ fn cmd_stats(path: String, json: bool) -> anyhow::Result<()> {
     tracing::info!("Статистика: path={}", path);
 
     // 1. Открыть БД (только чтение — не конкурирует с MCP-демоном)
-    let db_path = get_db_path(&path);
+    let db_path = get_db_path(&path)?;
     let storage = Storage::open_file_readonly(&db_path)?;
 
     // 2. Получить статистику
@@ -1285,7 +1290,7 @@ fn cmd_query(
     tracing::info!("Поиск символа '{}': path={}", symbol, path);
 
     // 1. Открыть БД (только чтение — не конкурирует с MCP-демоном)
-    let db_path = get_db_path(&path);
+    let db_path = get_db_path(&path)?;
     let storage = Storage::open_file_readonly(&db_path)?;
 
     // 2. Поиск символа
@@ -1376,7 +1381,7 @@ fn cmd_clean(path: String) -> anyhow::Result<()> {
     tracing::info!("Очистка индекса: path={}", path);
 
     // 1. Открыть БД
-    let db_path = get_db_path(&path);
+    let db_path = get_db_path(&path)?;
     let storage = Storage::open_file(&db_path)?;
 
     // 2. Разрешить корневой путь проекта
@@ -1448,7 +1453,8 @@ fn cmd_init(path: String) -> anyhow::Result<()> {
         .canonicalize()
         .unwrap_or_else(|_| PathBuf::from(&path));
 
-    let config_path = abs_path.join(".code-index").join("config.json");
+    let index_dir = crate::index_location::directory_for_path(&abs_path, None)?;
+    let config_path = index_dir.join("config.json");
 
     if config_path.exists() {
         println!("Конфигурация уже существует: {}", config_path.display());
@@ -1458,7 +1464,7 @@ fn cmd_init(path: String) -> anyhow::Result<()> {
 
     // 2. Создать конфиг по умолчанию
     let config = IndexConfig::default();
-    config.save(&abs_path)?;
+    config.save_to_dir(&index_dir)?;
 
     println!("Создан файл конфигурации: {}", config_path.display());
     println!("Отредактируйте его при необходимости:");
@@ -1595,6 +1601,9 @@ fn print_status_text(h: &crate::daemon_core::ipc::HealthResponse) {
             None => String::new(),
         };
         let err_s = p.error.as_ref().map(|e| format!(" err: {}", e)).unwrap_or_default();
-        println!("    - [{}] {}{}{}", status_s, p.path.display(), progress_s, err_s);
+        let db = crate::index_location::db_for_path(&p.path, None)
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|error| format!("ошибка пути индекса: {error}"));
+        println!("    - [{}] {} -> {}{}{}", status_s, p.path.display(), db, progress_s, err_s);
     }
 }

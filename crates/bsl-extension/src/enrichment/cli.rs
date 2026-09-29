@@ -90,7 +90,7 @@ pub async fn run_cli(argv: Vec<String>) -> Result<()> {
     let abs_path = Path::new(&args.path)
         .canonicalize()
         .unwrap_or_else(|_| PathBuf::from(&args.path));
-    let db_path = abs_path.join(".code-index").join("index.db");
+    let db_path = code_index_core::index_location::db_for_path(&abs_path, args.config.as_deref())?;
     if !db_path.exists() {
         return Err(anyhow!(
             "БД индекса не найдена: {}. Сначала запустите `bsl-indexer index {}`.",

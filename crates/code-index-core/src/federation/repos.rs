@@ -65,7 +65,9 @@ pub fn merge(
                     let root = raw_path
                         .canonicalize()
                         .unwrap_or_else(|_| raw_path.clone());
-                    let db = root.join(".code-index").join("index.db");
+                    let db = crate::index_location::directory_for_entry(
+                        daemon.paths.iter().find(|p| p.effective_alias() == entry.alias).unwrap()
+                    )?.join("index.db");
                     out.push(FederatedRepo {
                         alias: entry.alias.clone(),
                         ip: entry.ip.clone(),
@@ -147,6 +149,7 @@ mod tests {
                 .into_iter()
                 .map(|(path, alias)| PathEntry {
                     path: PathBuf::from(path),
+                    index_dir: None,
                     debounce_ms: None,
                     batch_ms: None,
                     alias: if alias.is_empty() { None } else { Some(alias.to_string()) },

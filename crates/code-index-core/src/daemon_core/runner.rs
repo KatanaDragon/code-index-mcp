@@ -56,6 +56,10 @@ pub async fn run(processor_registry: Option<Arc<ProcessorRegistry>>) -> Result<(
     // cfg обновляется in-memory, чтобы дальнейший код видел корректные
     // языки без повторного чтения с диска.
     migrate_languages(&cfg_path, &mut cfg)?;
+    for entry in &cfg.paths {
+        let db = crate::index_location::directory_for_entry(entry)?.join("index.db");
+        tracing::info!("индекс {} -> {}", entry.path.display(), db.display());
+    }
 
     let daemon_state = DaemonState::new();
     let (cmd_tx, mut cmd_rx) = commands::channel();
