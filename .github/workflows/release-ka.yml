@@ -26,6 +26,8 @@ jobs:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -46,9 +48,9 @@ jobs:
       - name: cargo build --release -p bsl-indexer --features enrichment
         shell: bash
         run: |
-          cargo build --release -p bsl-indexer --features enrichment
-          ls -l target/release/bsl-indexer.exe
-          ./target/release/bsl-indexer.exe --version
+          cargo build --release --target x86_64-pc-windows-msvc -p bsl-indexer --features enrichment
+          ls -l target/x86_64-pc-windows-msvc/release/bsl-indexer.exe
+          ./target/x86_64-pc-windows-msvc/release/bsl-indexer.exe --version
 
       - name: GitHub Release (pre-release в форк)
         shell: bash
@@ -56,9 +58,9 @@ jobs:
           NOTES="Сборка bsl-indexer для контура агента 1С: ветка build/ka-combined (релиз автора ${VERSION%-ka.*} + PR-ветки форм/СКД и scope у грепов). Состав — CHANGELOG.md, раздел Unreleased."
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
             echo "Релиз $GITHUB_REF_NAME уже есть (release_ka.py --local) — обновляю ассет"
-            gh release upload "$GITHUB_REF_NAME" target/release/bsl-indexer.exe --clobber
+            gh release upload "$GITHUB_REF_NAME" target/x86_64-pc-windows-msvc/release/bsl-indexer.exe --clobber
           else
-            gh release create "$GITHUB_REF_NAME" target/release/bsl-indexer.exe \
+            gh release create "$GITHUB_REF_NAME" target/x86_64-pc-windows-msvc/release/bsl-indexer.exe \
               --title "bsl-indexer $VERSION" --notes "$NOTES" --prerelease
           fi
           gh release view "$GITHUB_REF_NAME" --json assets --jq '.assets[] | "\(.name) \(.size)"'

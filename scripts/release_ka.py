@@ -34,6 +34,7 @@ if hasattr(sys.stdout, "reconfigure"):
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 EXE = "bsl-indexer.exe"
+WINDOWS_TARGET = "x86_64-pc-windows-msvc"
 GH_CANDIDATES = ["gh", r"C:\Program Files\GitHub CLI\gh.exe"]
 
 
@@ -144,9 +145,13 @@ def main() -> int:
     if not a.local:
         return выпуск_через_actions(a, branch.strip(), version, tag)
 
-    print("cargo build --release -p bsl-indexer --features enrichment …")
-    code, out = run(["cargo", "build", "--release", "-p", "bsl-indexer", "--features", "enrichment"])
-    exe = os.path.join(ROOT, "target", "release", EXE)
+    print(f"cargo build --release --target {WINDOWS_TARGET} -p bsl-indexer --features enrichment …")
+    # Не полагаться на host toolchain: этот asset устанавливается только на
+    # Windows x64 и должен быть MSVC-бинарником, как в публичном релизе.
+    run(["rustup", "target", "add", WINDOWS_TARGET])
+    code, out = run(["cargo", "build", "--release", "--target", WINDOWS_TARGET,
+                     "-p", "bsl-indexer", "--features", "enrichment"])
+    exe = os.path.join(ROOT, "target", WINDOWS_TARGET, "release", EXE)
     if code != 0 or not os.path.isfile(exe):
         print(out[-3000:])
         return 1
