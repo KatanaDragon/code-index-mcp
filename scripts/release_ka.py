@@ -35,6 +35,7 @@ if hasattr(sys.stdout, "reconfigure"):
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 EXE = "bsl-indexer.exe"
 WINDOWS_TARGET = "x86_64-pc-windows-msvc"
+WINDOWS_RUSTFLAGS = "-C target-feature=+crt-static"
 GH_CANDIDATES = ["gh", r"C:\Program Files\GitHub CLI\gh.exe"]
 
 
@@ -149,8 +150,10 @@ def main() -> int:
     # Не полагаться на host toolchain: этот asset устанавливается только на
     # Windows x64 и должен быть MSVC-бинарником, как в публичном релизе.
     run(["rustup", "target", "add", WINDOWS_TARGET])
+    build_env = os.environ.copy()
+    build_env["RUSTFLAGS"] = WINDOWS_RUSTFLAGS
     code, out = run(["cargo", "build", "--release", "--target", WINDOWS_TARGET,
-                     "-p", "bsl-indexer", "--features", "enrichment"])
+                     "-p", "bsl-indexer", "--features", "enrichment"], env=build_env)
     exe = os.path.join(ROOT, "target", WINDOWS_TARGET, "release", EXE)
     if code != 0 or not os.path.isfile(exe):
         print(out[-3000:])
