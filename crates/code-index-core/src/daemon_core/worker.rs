@@ -99,19 +99,49 @@ fn probe_db(db_path: &std::path::Path) -> DbProbe {
 }
 
 fn probe_db_once(db_path: &std::path::Path) -> DbProbe {
-    let storage = match Storage::open_file_readonly(db_path) {
-        Ok(s) => s,
-        Err(e) => return DbProbe::Unreadable(format!("{:#}", e)),
+    match проба_базы(db_path, false) {
+        Ok(проба) => проба,
+        Err(ошибка_чтения) => {
+            // Только для чтения не открылась — так выглядит незавершённое
+            // восстановление журнала: за базой остался `-shm`/`-wal` от убитого
+            // процесса или от закрывшегося читателя, а читателю запись в журнал
+            // недоступна (serve/stats на такой базе отвечают «unable to open
+            // database file», код 14). Демон — владелец базы, и восстановление
+            // за ним: открываем её на запись, как сделает worker следующими
+            // строками. Заодно это лечит состояние — открытие на запись
+            // схлопывает журнал и пересобирает его индекс.
+            match проба_базы(db_path, true) {
+                Ok(проба) => {
+                    tracing::warn!(
+                        "база {} читалась только после открытия на запись: журнал был в \
+                         несогласованном состоянии, открытие его исправило",
+                        db_path.display()
+                    );
+                    проба
+                }
+                Err(ошибка_записи) => DbProbe::Unreadable(format!(
+                    "чтение: {:#}; на запись: {:#}",
+                    ошибка_чтения, ошибка_записи
+                )),
+            }
+        }
+    }
+}
+
+/// Проба базы одним соединением: `Ok(проба)` или ошибка открытия/чтения.
+fn проба_базы(db_path: &std::path::Path, на_запись: bool) -> anyhow::Result<DbProbe> {
+    let storage = if на_запись {
+        Storage::open_file(db_path)?
+    } else {
+        Storage::open_file_readonly(db_path)?
     };
-    match storage
+    let exists = storage
         .conn()
         .query_row("SELECT EXISTS(SELECT 1 FROM files)", [], |row| {
             row.get::<_, i64>(0)
-        }) {
-        Ok(0) => DbProbe::Empty,
-        Ok(_) => DbProbe::HasData,
-        Err(e) => DbProbe::Unreadable(format!("запрос к таблице files: {}", e)),
-    }
+        })
+        .map_err(|e| anyhow::anyhow!("запрос к таблице files базы {}: {}", db_path.display(), e))?;
+    Ok(if exists == 0 { DbProbe::Empty } else { DbProbe::HasData })
 }
 
 /// Отметить путь сбойным, оставив причину и в статусе, и в журнале демона.
