@@ -390,14 +390,47 @@ fn build_repo_entries(
         let root = Path::new(&dir)
             .canonicalize()
             .unwrap_or_else(|_| PathBuf::from(&dir));
-        let db_path = crate::index_location::db_for_path(&root, config_path)?;
+        // Один негодный путь не должен отменять остальные: без базы репо
+        // пометится недоступным (см. открытие ниже), а сервер поднимется.
+        let db_path = match crate::index_location::db_for_path(&root, config_path) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::error!(
+                    "MCP repo '{}' ({}) пропущен: каталог индекса не разрешён: {:#}",
+                    alias,
+                    root.display(),
+                    e
+                );
+                continue;
+            }
+        };
 
         // Если БД ещё нет — создаём пустую со схемой, чтобы сервер мог стартовать.
         // Данные появятся, когда демон проиндексирует путь.
         if !db_path.exists() {
-            std::fs::create_dir_all(db_path.parent().unwrap())?;
-            let storage = Storage::open_file(&db_path)?;
-            drop(storage);
+            if let Some(parent) = db_path.parent() {
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    tracing::error!(
+                        "MCP repo '{}': каталог {} не создан: {}",
+                        alias,
+                        parent.display(),
+                        e
+                    );
+                    continue;
+                }
+            }
+            match Storage::open_file(&db_path) {
+                Ok(storage) => drop(storage),
+                Err(e) => {
+                    tracing::error!(
+                        "MCP repo '{}': пустая база {} не создана: {:#}",
+                        alias,
+                        db_path.display(),
+                        e
+                    );
+                    continue;
+                }
+            }
         }
 
         tracing::info!("MCP repo: {} -> {}", alias, root.display());
@@ -817,13 +850,42 @@ async fn cmd_serve(
         };
 
         // Создать пустые БД для local-репо, чтобы сервер мог открыть
-        // их read-only до индексации демоном.
+        // их read-only до индексации демоном. Путь, для которого это не
+        // получилось, не отменяет остальные — он будет помечен недоступным
+        // при открытии баз ниже.
         for daemon_entry in &daemon_cfg.paths {
-            let db_path = crate::index_location::directory_for_entry(daemon_entry)?.join("index.db");
+            let db_path = match crate::index_location::directory_for_entry(daemon_entry) {
+                Ok(dir) => dir.join("index.db"),
+                Err(e) => {
+                    tracing::error!(
+                        "путь {} пропущен: каталог индекса не разрешён: {:#}",
+                        daemon_entry.path.display(),
+                        e
+                    );
+                    continue;
+                }
+            };
             if !db_path.exists() {
-                std::fs::create_dir_all(db_path.parent().unwrap())?;
-                let storage = Storage::open_file(&db_path)?;
-                drop(storage);
+                if let Some(parent) = db_path.parent() {
+                    if let Err(e) = std::fs::create_dir_all(parent) {
+                        tracing::error!(
+                            "путь {}: каталог {} не создан: {}",
+                            daemon_entry.path.display(),
+                            parent.display(),
+                            e
+                        );
+                        continue;
+                    }
+                }
+                match Storage::open_file(&db_path) {
+                    Ok(storage) => drop(storage),
+                    Err(e) => tracing::error!(
+                        "путь {}: пустая база {} не создана: {:#}",
+                        daemon_entry.path.display(),
+                        db_path.display(),
+                        e
+                    ),
+                }
             }
         }
 
@@ -933,18 +995,29 @@ async fn cmd_serve(
         Some(reg) => {
             let mut map = std::collections::BTreeMap::new();
             for (alias, root_path, db_path) in entries {
-                let storage = crate::storage::StoragePool::open_file_readonly(
+                // Недоступная база помечает только свой репо: остальные
+                // обслуживаются (см. `CodeIndexServer::from_federated`).
+                let (storage, unavailable) = match crate::storage::StoragePool::open_file_readonly(
                     &db_path,
                     crate::storage::PoolConfig::default(),
-                )?;
+                ) {
+                    Ok(pool) => (Some(pool), None),
+                    Err(e) => {
+                        let причина =
+                            format!("База индекса {} не открыта: {:#}", db_path.display(), e);
+                        tracing::error!("репо '{}' недоступен: {}", alias, причина);
+                        (None, Some(причина))
+                    }
+                };
                 map.insert(alias, crate::mcp::RepoEntry {
                     root_path: Some(root_path),
-                    storage: Some(storage),
+                    storage,
                     ip: "127.0.0.1".to_string(),
                     port: crate::federation::client::DEFAULT_REMOTE_PORT,
                     is_local: true,
                     language: None,
                     processor: None,
+                    unavailable,
                 });
             }
             CodeIndexServer::with_repos_and_registry(map, reg)

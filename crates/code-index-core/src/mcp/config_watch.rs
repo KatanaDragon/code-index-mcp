@@ -280,6 +280,7 @@ mod tests {
             is_local: false,
             language: None,
             processor: None,
+            unavailable: None,
         }
     }
 

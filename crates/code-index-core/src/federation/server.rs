@@ -459,6 +459,17 @@ async fn handle_extension_tool(
         }
     };
 
+    // Репо с неоткрытой базой отвечает причиной: расширенный инструмент читает
+    // базу напрямую, и паника в пуле выдала бы клиенту ошибку связи вместо
+    // причины по конкретному пути.
+    if let Some(причина) = entry.unavailable.as_ref() {
+        return ok_json(federation_error(
+            &p.tool_name,
+            &server.own_ip,
+            format!("репо '{}' недоступен: {}", repo, причина),
+        ));
+    }
+
     let storage = entry.storage_pool();
     let root_path: Option<&std::path::Path> = entry.root_path.as_deref();
     let language: Option<&str> = entry.language.as_deref();

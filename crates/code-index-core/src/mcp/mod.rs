@@ -72,6 +72,14 @@ pub struct RepoEntry {
     /// (`LanguageProcessor::declarative_callers`). `None` — remote-репо,
     /// язык не определён либо сервер собран без реестра.
     pub processor: Option<Arc<dyn LanguageProcessor>>,
+    /// Почему локальный репо не обслуживается: база индекса не открылась при
+    /// старте сервера. `None` — репо исправен.
+    ///
+    /// Сбойный путь не должен ронять весь сервер выдачи: остальные репо
+    /// работают, а инструменты по этому алиасу отвечают причиной (дефект
+    /// 01.10.2026 — один путь в состоянии «ошибка» делал MCP недоступным
+    /// сразу во всех клиентах).
+    pub unavailable: Option<String>,
 }
 
 impl RepoEntry {
@@ -542,15 +550,39 @@ impl CodeIndexServer {
                         repo.ip
                     )
                 })?;
-                let storage = StoragePool::open_file_readonly(db_path, pool_cfg)?;
-                RepoEntry {
-                    root_path: repo.root_path,
-                    storage: Some(storage),
-                    ip: repo.ip,
-                    port: repo.port,
-                    is_local: true,
-                    language: local_languages.get(&repo.alias).cloned(),
-                    processor: None,
+                // База открывается ПО ПУТИ: недоступный репо помечается и
+                // отвечает причиной, а остальные продолжают работать. Общий
+                // отказ сервера из-за одного пути (дефект 01.10.2026) делал
+                // MCP недоступным во всех клиентах, включая исправные репо.
+                match StoragePool::open_file_readonly(db_path, pool_cfg.clone()) {
+                    Ok(storage) => RepoEntry {
+                        root_path: repo.root_path,
+                        storage: Some(storage),
+                        ip: repo.ip,
+                        port: repo.port,
+                        is_local: true,
+                        language: local_languages.get(&repo.alias).cloned(),
+                        processor: None,
+                        unavailable: None,
+                    },
+                    Err(e) => {
+                        let причина = format!(
+                            "База индекса {} не открыта: {:#}",
+                            db_path.display(),
+                            e
+                        );
+                        tracing::error!("репо '{}' недоступен: {}", repo.alias, причина);
+                        RepoEntry {
+                            root_path: repo.root_path,
+                            storage: None,
+                            ip: repo.ip,
+                            port: repo.port,
+                            is_local: true,
+                            language: local_languages.get(&repo.alias).cloned(),
+                            processor: None,
+                            unavailable: Some(причина),
+                        }
+                    }
                 }
             } else {
                 RepoEntry {
@@ -561,6 +593,7 @@ impl CodeIndexServer {
                     is_local: false,
                     language: None,
                     processor: None,
+                    unavailable: None,
                 }
             };
             map.insert(repo.alias, entry);
@@ -595,15 +628,27 @@ impl CodeIndexServer {
     pub fn open_readonly_multi(entries: Vec<(String, PathBuf, PathBuf)>) -> anyhow::Result<Self> {
         let mut map = BTreeMap::new();
         for (alias, root_path, db_path) in entries {
-            let storage = StoragePool::open_file_readonly(&db_path, PoolConfig::default())?;
+            // Как и в `from_federated`: недоступный путь помечает только свой
+            // репо, остальные обслуживаются.
+            let (storage, unavailable) =
+                match StoragePool::open_file_readonly(&db_path, PoolConfig::default()) {
+                    Ok(pool) => (Some(pool), None),
+                    Err(e) => {
+                        let причина =
+                            format!("База индекса {} не открыта: {:#}", db_path.display(), e);
+                        tracing::error!("репо '{}' недоступен: {}", alias, причина);
+                        (None, Some(причина))
+                    }
+                };
             map.insert(alias, RepoEntry {
                 root_path: Some(root_path),
-                storage: Some(storage),
+                storage,
                 ip: LEGACY_OWN_IP.to_string(),
                 port: crate::federation::client::DEFAULT_REMOTE_PORT,
                 is_local: true,
                 language: None,
                 processor: None,
+                unavailable,
             });
         }
         Ok(Self::with_repos(map))
@@ -625,6 +670,7 @@ impl CodeIndexServer {
             is_local: true,
             language: None,
             processor: None,
+            unavailable: None,
         });
         Self::with_repos(map)
     }
@@ -856,8 +902,12 @@ impl CodeIndexServer {
     }
 
     /// Получить RepoEntry по alias или вернуть ToolUnavailable::UnknownRepo JSON.
+    ///
+    /// Репо с недоступной базой отвечает на ЛЮБОЙ инструмент причиной отказа по
+    /// этому пути — остальные репо сервера при этом работают (дефект
+    /// 01.10.2026: один сбойный путь в daemon.toml ронял сервер выдачи целиком).
     pub(crate) fn resolve_repo(&self, alias: &str) -> Result<&RepoEntry, String> {
-        self.repos.get(alias).ok_or_else(|| {
+        let entry = self.repos.get(alias).ok_or_else(|| {
             tools::format_unavailable(crate::daemon_core::ipc::ToolUnavailable::UnknownRepo {
                 message: format!(
                     "Неизвестный repo '{}'. Доступные: {:?}. Укажите один из алиасов, переданных в --path alias=dir при запуске сервера.",
@@ -865,7 +915,18 @@ impl CodeIndexServer {
                     self.repo_aliases()
                 ),
             })
-        })
+        })?;
+        if let Some(причина) = entry.unavailable.as_ref() {
+            return Err(tools::format_unavailable(
+                crate::daemon_core::ipc::ToolUnavailable::Error {
+                    message: format!(
+                        "Репо '{}' сейчас не обслуживается: {}",
+                        alias, причина
+                    ),
+                },
+            ));
+        }
+        Ok(entry)
     }
 }
 
@@ -1895,6 +1956,20 @@ impl ServerHandler for CodeIndexServer {
                 serde_json::from_str(&body).unwrap_or_else(|_| serde_json::json!({"raw": body}));
             return self.finish(&session_id, &dedup_scope, Ok(CallToolResult::structured(value)));
         }
+        // Расширенные инструменты читают базу напрямую — недоступный репо
+        // отвечает причиной, как и обычные (см. `resolve_repo`).
+        if let Some(причина) = entry.unavailable.as_ref() {
+            let json = tools::format_unavailable(crate::daemon_core::ipc::ToolUnavailable::Error {
+                message: format!("Репо '{}' сейчас не обслуживается: {}", repo, причина),
+            });
+            return self.finish(
+                &session_id,
+                &dedup_scope,
+                Ok(CallToolResult::structured(
+                    serde_json::from_str(&json).unwrap_or_else(|_| serde_json::json!({"raw": json})),
+                )),
+            );
+        }
         let storage = entry.storage_pool();
         let root_path: Option<&Path> = entry.root_path.as_deref();
         let language: Option<&str> = entry.language.as_deref();
@@ -2295,6 +2370,7 @@ mod conditional_registration_tests {
             is_local: false,
             language: language.map(String::from),
             processor: None,
+            unavailable: None,
         }
     }
 

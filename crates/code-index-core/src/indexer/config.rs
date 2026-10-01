@@ -357,12 +357,12 @@ impl IndexConfig {
             match Glob::new(pat) {
                 Ok(g) => { builder.add(g); }
                 Err(e) => {
-                    eprintln!("[config] некорректный exclude_file_pattern '{}': {}", pat, e);
+                    tracing::warn!("[config] некорректный exclude_file_pattern '{}': {}", pat, e);
                 }
             }
         }
         builder.build().unwrap_or_else(|e| {
-            eprintln!("[config] GlobSetBuilder.build failed: {}", e);
+            tracing::warn!("[config] GlobSetBuilder.build failed: {}", e);
             GlobSet::empty()
         })
     }

@@ -19,6 +19,183 @@ fn set_stmt_cache(conn: &Connection) {
     conn.set_prepared_statement_cache_capacity(64);
 }
 
+/// Сколько ждать занятую базу при открытии только для чтения.
+///
+/// Умолчание SQLite — не ждать вовсе; секунды здесь стоят дешевле ложного
+/// отказа (см. `Storage::open_file_readonly`).
+const READONLY_BUSY_TIMEOUT_SEC: u64 = 5;
+
+/// Проверить, что SQLite есть где создавать временные файлы, и починить, если нет.
+///
+/// Во временный каталог SQLite кладёт журнал оператора и сортировщик. Без него
+/// падает любая запись, которой нужен временный файл: удаление файла из индекса
+/// (у `files` есть триггеры синхронизации FTS) и крупные запросы. Ошибка при
+/// этом — `unable to open database file` (код 14), то есть выглядит как сбой
+/// самой базы, хотя база цела. Дефект 01.10.2026 на КА: демон, запущенный из
+/// среды с чужим `TMP` (например, `/tmp` из git-bash), ронял worker на первом же
+/// удалении, и после пяти перезапусков путь уходил в «ошибка».
+///
+/// Каталог берётся из переменных окружения процесса (`TMP`/`TEMP`/`TMPDIR`).
+/// Если он не создаётся, ставим запасной (обычно `<CODE_INDEX_HOME>/tmp`) — прямо
+/// в переменные, потому что `GetTempPath` перечитывает их на каждом вызове.
+///
+/// Returns:
+///     `(каталог, чем закончилось)` — текст идёт в журнал запуска.
+pub fn ensure_temp_dir_for_sqlite(fallback_parent: &Path) -> (std::path::PathBuf, String) {
+    let текущий = std::env::temp_dir();
+    if temp_dir_writable(&текущий) {
+        return (текущий.clone(), format!("временный каталог {} пригоден", текущий.display()));
+    }
+    let запасной = fallback_parent.join("tmp");
+    if std::fs::create_dir_all(&запасной).is_ok() && temp_dir_writable(&запасной) {
+        // SQLite (Windows) читает TMP/TEMP через GetTempPath, unix — TMPDIR.
+        std::env::set_var("TMPDIR", &запасной);
+        std::env::set_var("TMP", &запасной);
+        std::env::set_var("TEMP", &запасной);
+        return (
+            запасной.clone(),
+            format!(
+                "ВНИМАНИЕ: временный каталог {} недоступен на запись — для баз индекса \
+                 задействован {} (переменные TMP/TEMP/TMPDIR процесса переназначены; \
+                 без этого записи падали бы с «unable to open database file», код 14)",
+                текущий.display(),
+                запасной.display()
+            ),
+        );
+    }
+    (
+        текущий.clone(),
+        format!(
+            "ВНИМАНИЕ: ни {} , ни {} не годятся для временных файлов — записи с триггерами \
+             и крупные запросы будут падать с «unable to open database file» (код 14); \
+             выставьте TMP в существующий каталог",
+            текущий.display(),
+            запасной.display()
+        ),
+    )
+}
+
+/// Скопировать файловую базу в память через SQLite Backup API с ограниченным ожиданием.
+///
+/// `Backup::run_to_completion` при занятом источнике (Busy/Locked) повторяет шаг
+/// без паузы — то есть крутится на 100 % ядра, пока источник не освободится, и
+/// НИКОГДА не возвращает ошибку. Для демона это худший из отказов: worker не
+/// завершается, не перезапускается сторожем и держит permit очереди на первичную
+/// индексацию — остальные пути не индексируются вовсе, а в журнале нет ни строки.
+/// Поэтому шагаем сами: пауза между попытками и общий дедлайн, после которого
+/// причина уходит наверх обычной ошибкой (её пишет worker).
+fn copy_disk_to_memory(
+    disk_conn: &Connection,
+    memory_conn: &mut Connection,
+    db_path: &Path,
+) -> Result<()> {
+    /// Через сколько отказаться от копирования.
+    const BACKUP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
+    /// Пауза между шагами копирования, когда источник занят.
+    const BACKUP_BUSY_PAUSE: std::time::Duration = std::time::Duration::from_millis(100);
+
+    let backup = rusqlite::backup::Backup::new(disk_conn, memory_conn)
+        .context("Не удалось инициализировать backup disk→memory")?;
+    let до = std::time::Instant::now() + BACKUP_DEADLINE;
+    /// Сколько шагов копирования подряд без прироста считать зацикливанием.
+    /// Копия 112 страниц укладывается в считанные шаги, поэтому запас огромный;
+    /// срабатывает он на другом: SQLite перезапускает копирование, когда видит
+    /// изменение источника, и при несогласованном состоянии рядом с базой
+    /// (`-shm` от убитого процесса) перезапускается на каждом шаге — прогресс
+    /// замирает навсегда (наблюдалось: 112 страниц, сдвиг с 100-й, 100 % ядра,
+    /// ни одной операции ввода-вывода, десятки тысяч шагов в секунду).
+    const BACKUP_STALL_STEPS: u64 = 5000;
+
+    let mut скопировано = 0;
+    let mut перезапусков = 0u32;
+    let mut шагов = 0u64;
+    let mut последний_рост = 0u64;
+    loop {
+        шагов += 1;
+        match backup.step(100) {
+            Ok(rusqlite::backup::StepResult::Done) => return Ok(()),
+            Ok(rusqlite::backup::StepResult::More) => {
+                // Источник, который меняется во время копирования, заставляет
+                // SQLite начинать копию заново — шаг снова и снова возвращает
+                // «ещё есть что копировать», и без дедлайна это вечный цикл на
+                // 100 % ядра (дефект 02.10.2026: worker висел часами и держал
+                // очередь индексации, а в журнале не было ни строки).
+                let прогресс = backup.progress();
+                let стало = (прогресс.pagecount - прогресс.remaining).max(0);
+                if стало > скопировано {
+                    последний_рост = шагов;
+                }
+                if стало < скопировано {
+                    перезапусков += 1;
+                    if перезапусков == 1 || перезапусков % 20 == 0 {
+                        tracing::warn!(
+                            "копирование {} в память начинается заново ({} раз): базу меняет \
+                             другой процесс",
+                            db_path.display(),
+                            перезапусков
+                        );
+                    }
+                }
+                скопировано = стало;
+            }
+            Ok(rusqlite::backup::StepResult::Busy) | Ok(rusqlite::backup::StepResult::Locked) => {
+                std::thread::sleep(BACKUP_BUSY_PAUSE);
+            }
+            Err(e) => return Err(e).context("Ошибка при копировании БД disk→memory"),
+            // Новые исходы `StepResult` в будущих версиях rusqlite: чтобы не
+            // крутиться на них молча, считаем их незавершённым шагом с паузой.
+            Ok(_) => std::thread::sleep(BACKUP_BUSY_PAUSE),
+        }
+        if шагов <= 3 || шагов % 10000 == 0 {
+            tracing::debug!(
+                "шаг копирования {}: шагов {}, скопировано {} страниц из {}",
+                db_path.display(),
+                шагов,
+                скопировано,
+                backup.progress().pagecount
+            );
+        }
+        if шагов - последний_рост >= BACKUP_STALL_STEPS {
+            anyhow::bail!(
+                "копирование базы {} в память не продвигается: {} шагов без прироста, \
+                 скопировано {} страниц из {}. Так выглядит перезапуск копирования на каждом \
+                 шаге — рядом с базой осталось несогласованное состояние (файл -shm от убитого \
+                 процесса). Повторная попытка открытия базы обычно снимает это состояние",
+                db_path.display(),
+                BACKUP_STALL_STEPS,
+                скопировано,
+                backup.progress().pagecount
+            );
+        }
+        if std::time::Instant::now() >= до {
+            anyhow::bail!(
+                "не удалось скопировать базу {} в память за {} с (перезапусков копирования: {}) — \
+                 источник занят или меняется другим процессом; копирование прервано, чтобы \
+                 не держать очередь индексации",
+                db_path.display(),
+                BACKUP_DEADLINE.as_secs(),
+                перезапусков
+            );
+        }
+    }
+}
+
+/// Можно ли создать файл в каталоге (SQLite делает ровно это и ждёт успеха).
+fn temp_dir_writable(dir: &Path) -> bool {
+    let имя = dir.join(format!(
+        "code-index-temp-probe-{}-{:?}.tmp",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    match std::fs::write(&имя, b"probe") {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&имя);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
 /// Зарегистрировать scalar-функцию REGEXP для поддержки оператора REGEXP в SQL.
 /// Использует crate `regex` — никаких внешних расширений SQLite не нужно.
 /// Кеширует скомпилированный Regex через RefCell — компиляция один раз за запрос.
@@ -193,7 +370,14 @@ impl Storage {
     }
 
     /// Открыть БД только для чтения — не пишет в БД, не блокирует.
-    /// Используется CLI-командами для параллельной работы с MCP-демоном.
+    /// Используется CLI-командами для параллельной работы с MCP-демоном,
+    /// пробой базы в воркере и сервером выдачи.
+    ///
+    /// Ожидание занятости (busy_timeout) включено: базу в этот момент может
+    /// держать писатель — демон схлопывает журнал WAL, другой воркер
+    /// заканчивает транзакцию. Без ожидания SQLite отдаёт «database is locked»
+    /// сразу, и вызывающий видит отказ там, где достаточно было подождать
+    /// (сервер выдачи падал целиком, а демон принимал готовую базу за новую).
     pub fn open_file_readonly(path: &Path) -> Result<Self> {
         let conn = Connection::open_with_flags(
             path,
@@ -202,6 +386,8 @@ impl Storage {
                 | OpenFlags::SQLITE_OPEN_URI,
         )
         .with_context(|| format!("Не удалось открыть БД (readonly): {}", path.display()))?;
+        conn.busy_timeout(std::time::Duration::from_secs(READONLY_BUSY_TIMEOUT_SEC))
+            .with_context(|| format!("Не удалось задать ожидание занятости: {}", path.display()))?;
         schema::initialize_readonly(&conn).context("Ошибка инициализации readonly-схемы")?;
         register_sql_functions(&conn)?;
         Ok(Self { conn, in_memory: false })
@@ -226,23 +412,44 @@ impl Storage {
 
         match mode {
             memory::StorageMode::InMemory => {
-                eprintln!("[storage] Режим: in-memory (БД загружена в RAM)");
+                // Через журнал, а не в stderr: печать в stderr блокирует
+                // worker, если stderr — труба без читателя (демон, поднятый
+                // из среды агента). См. дефект 01.10.2026.
+                tracing::debug!("хранилище: режим in-memory (база загружена в RAM)");
 
                 if db_path.exists() {
                     // Загрузить данные с диска в память через backup API
                     let disk_conn = Connection::open(db_path)
                         .with_context(|| format!("Не удалось открыть файл БД: {}", db_path.display()))?;
+                    // Привести журнал в согласованное состояние ДО копирования.
+                    // За базой мог остаться `-shm`/`-wal` от убитого процесса или
+                    // от закрывшегося читателя (readonly-соединение не удаляет их
+                    // за собой). С таким состоянием SQLite перезапускает копию на
+                    // каждом шаге, прогресс замирает навсегда (дефект 02.10.2026:
+                    // worker висел часами, 100 % ядра, ни одной операции обмена).
+                    // Контрольная точка вытесняет журнал и пересобирает его индекс.
+                    if let Err(e) = disk_conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);") {
+                        tracing::warn!(
+                            "не удалось схлопнуть журнал {} перед копированием в память: {} \
+                             (база занята другим процессом?)",
+                            db_path.display(),
+                            e
+                        );
+                    }
+                    // Источник копирования может быть занят другим процессом
+                    // (сервер выдачи, CLI). Без ожидания шаг копирования отдаёт
+                    // Busy — и раньше это был бесконечный цикл на 100 % ядра:
+                    // worker не завершался и держал permit очереди, из-за чего
+                    // остальные пути не индексировались (наблюдалось 02.10.2026:
+                    // mdm\src\cfe висел 14 ч, демон сжёг 14,5 ч процессорного
+                    // времени). См. `copy_disk_to_memory`.
+                    disk_conn
+                        .busy_timeout(std::time::Duration::from_secs(READONLY_BUSY_TIMEOUT_SEC))
+                        .context("Не удалось задать ожидание занятости (backup)")?;
                     let mut memory_conn = Connection::open_in_memory()
                         .context("Не удалось создать in-memory БД")?;
 
-                    // Копируем disk → memory (Backup::new(src, &mut dst))
-                    {
-                        let backup = rusqlite::backup::Backup::new(&disk_conn, &mut memory_conn)
-                            .context("Не удалось инициализировать backup disk→memory")?;
-                        backup
-                            .run_to_completion(100, std::time::Duration::from_millis(0), None)
-                            .context("Ошибка при копировании БД disk→memory")?;
-                    }
+                    copy_disk_to_memory(&disk_conn, &mut memory_conn, db_path)?;
 
                     // H-1: настройки соединения. У этого пути их не выставляли
                     // вовсе — в отличие от `schema::initialize`. Журнал и запись
@@ -269,7 +476,7 @@ impl Storage {
                 }
             }
             memory::StorageMode::Disk => {
-                eprintln!("[storage] Режим: disk (WAL)");
+                tracing::debug!("хранилище: режим disk (WAL)");
                 Self::open_file(db_path)
             }
         }
@@ -5463,5 +5670,15 @@ mod tests {
             )
             .unwrap();
         assert_eq!(oversize, 1, "после идемпотентных вызовов таблица должна работать");
+    }
+
+    /// Каталог для временных файлов SQLite проверяется записью: именно её делает
+    /// и сам SQLite, и именно она падает у демона с чужим TMP (код 14).
+    #[test]
+    fn временный_каталог_проверяется_записью() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        assert!(temp_dir_writable(tmp.path()), "обычный каталог обязан подойти");
+        let нет = tmp.path().join("нет-такого-каталога");
+        assert!(!temp_dir_writable(&нет), "несуществующий каталог не годится");
     }
 }

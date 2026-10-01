@@ -49,6 +49,22 @@ pub async fn run(processor_registry: Option<Arc<ProcessorRegistry>>) -> Result<(
         cfg.paths.len()
     );
 
+    // Временный каталог для SQLite — до первого открытия базы. Если он негоден,
+    // записи с триггерами и крупные запросы падают с кодом 14 («unable to open
+    // database file»), и это выглядит как сбой базы (дефект 01.10.2026: демон,
+    // запущенный из среды с чужим TMP, ронял worker на первом удалении из индекса).
+    {
+        let запасной_родитель = cfg_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."));
+        let (каталог, отчёт) = crate::storage::ensure_temp_dir_for_sqlite(запасной_родитель);
+        if отчёт.starts_with("ВНИМАНИЕ") {
+            tracing::warn!("{}", отчёт);
+        } else {
+            tracing::info!("временные файлы SQLite: {}", каталог.display());
+        }
+    }
+
     // Миграция: заполнить language у тех [[paths]], где он не задан
     // (старые конфиги до этой версии не имели поля language).
     // Auto-detect → дозапись обратно в TOML через toml_edit (сохраняет
@@ -57,8 +73,21 @@ pub async fn run(processor_registry: Option<Arc<ProcessorRegistry>>) -> Result<(
     // языки без повторного чтения с диска.
     migrate_languages(&cfg_path, &mut cfg)?;
     for entry in &cfg.paths {
-        let db = crate::index_location::directory_for_entry(entry)?.join("index.db");
-        tracing::info!("индекс {} -> {}", entry.path.display(), db.display());
+        // Негодная настройка одного пути не должна мешать старту демона:
+        // иначе из-за одной строки в daemon.toml встают все репозитории.
+        // Причину скажет worker этого пути — он получит ту же ошибку.
+        match crate::index_location::directory_for_entry(entry) {
+            Ok(db_dir) => tracing::info!(
+                "индекс {} -> {}",
+                entry.path.display(),
+                db_dir.join("index.db").display()
+            ),
+            Err(e) => tracing::error!(
+                "путь {} не обслуживается: каталог индекса не разрешён: {:#}",
+                entry.path.display(),
+                e
+            ),
+        }
     }
 
     let daemon_state = DaemonState::new();
@@ -116,6 +145,14 @@ pub async fn run(processor_registry: Option<Arc<ProcessorRegistry>>) -> Result<(
     // Backoff перезапусков: (число попыток, время последней) на путь. Защита от
     // шторма перезапусков при устойчиво падающем worker'е.
     let mut respawn_tracker: HashMap<PathBuf, (u32, std::time::Instant)> = HashMap::new();
+    // Последняя причина аварийного выхода на путь: и в строку журнала о
+    // перезапуске, и в итоговый статус «ошибка» (иначе причина теряется —
+    // статус перетирается сторожем, а в журнале остаётся только факт падения).
+    let mut worker_errors: HashMap<PathBuf, String> = HashMap::new();
+    // Редкие повторные пробы путей, исчерпавших частые перезапуски, и признак
+    // «об этом эпизоде уже сообщено» (чтобы не сыпать одной строкой каждые 5 с).
+    let mut rare_retries: HashMap<PathBuf, std::time::Instant> = HashMap::new();
+    let mut rare_reported: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
     let indexer_section = cfg.indexer.clone();
 
     // Event-based cache invalidation (этап 3, v0.9.1+): создаём один общий
@@ -193,6 +230,9 @@ pub async fn run(processor_registry: Option<Arc<ProcessorRegistry>>) -> Result<(
                     &mut workers,
                     &worker_entries,
                     &mut respawn_tracker,
+                    &mut worker_errors,
+                    &mut rare_retries,
+                    &mut rare_reported,
                     &shutdown_tx,
                     &initial_limiter,
                     &indexer_section,
@@ -395,6 +435,22 @@ fn allow_respawn(
     slot.0 <= max
 }
 
+/// Пора ли снова пробовать путь после того, как частые перезапуски исчерпаны.
+///
+/// Первый раз — сразу (записи о пути ещё нет), дальше — не чаще `window`.
+/// Вынесено чистой функцией ради модульного теста.
+fn rare_retry_due(
+    tracker: &HashMap<PathBuf, std::time::Instant>,
+    path: &PathBuf,
+    now: std::time::Instant,
+    window: std::time::Duration,
+) -> bool {
+    match tracker.get(path) {
+        Some(когда) => now.duration_since(*когда) >= window,
+        None => true,
+    }
+}
+
 /// Сторож worker'ов. Перезапускает потоки, завершившиеся НЕ по общему shutdown
 /// (паника внутри батча или ранний выход из-за ошибки транзакции). В штатном
 /// режиме worker живёт до shutdown, поэтому `is_finished()` во время работы
@@ -410,6 +466,9 @@ async fn supervise_workers(
     workers: &mut HashMap<PathBuf, tokio::task::JoinHandle<()>>,
     worker_entries: &HashMap<PathBuf, PathEntry>,
     respawn_tracker: &mut HashMap<PathBuf, (u32, std::time::Instant)>,
+    last_errors: &mut HashMap<PathBuf, String>,
+    rare_retries: &mut HashMap<PathBuf, std::time::Instant>,
+    rare_reported: &mut std::collections::HashSet<PathBuf>,
     shutdown_tx: &broadcast::Sender<()>,
     initial_limiter: &Option<Arc<Semaphore>>,
     indexer_section: &IndexerSection,
@@ -418,6 +477,11 @@ async fn supervise_workers(
 ) {
     const RESPAWN_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
     const MAX_RESPAWNS: u32 = 5;
+    /// Как часто пробовать путь после того, как частые перезапуски исчерпаны.
+    /// Редкая проба лечит временные причины (каталог исчез на перевыгрузке
+    /// конфигурации, база занята чужим процессом) без перезапуска демона и при
+    /// этом не крутит бесконечный цикл на устойчиво сломанном пути.
+    const RARE_RETRY_WINDOW: std::time::Duration = std::time::Duration::from_secs(300);
 
     // Сначала собрать пути завершившихся потоков, потом мутировать `workers`.
     let finished: Vec<PathBuf> = workers
@@ -427,12 +491,31 @@ async fn supervise_workers(
         .collect();
 
     for path in finished {
+        // Причина берётся из статуса пути ДО того, как сторож запишет туда своё
+        // «перезапускается»: иначе причина раннего выхода теряется, и в журнале
+        // остаётся только факт «worker завершился сам» (дефект 01.10.2026).
+        let причина = state
+            .get(&path)
+            .await
+            .and_then(|runtime| runtime.error)
+            .filter(|текст| !текст.starts_with("worker "));
+        if let Some(текст) = причина.as_ref() {
+            last_errors.insert(path.clone(), текст.clone());
+        }
+
         if let Some(handle) = workers.remove(&path) {
             match handle.await {
-                Ok(()) => tracing::warn!(
-                    "worker {} завершился сам (не по команде остановки) — перезапуск",
-                    path.display()
-                ),
+                Ok(()) => match причина.as_ref() {
+                    Some(текст) => tracing::warn!(
+                        "worker {} завершился сам (не по команде остановки) — перезапуск; причина: {}",
+                        path.display(),
+                        текст
+                    ),
+                    None => tracing::warn!(
+                        "worker {} завершился сам (не по команде остановки) — перезапуск",
+                        path.display()
+                    ),
+                },
                 Err(e) => {
                     tracing::error!("worker {} упал ({}) — перезапуск", path.display(), e)
                 }
@@ -456,26 +539,49 @@ async fn supervise_workers(
             }
         };
 
-        if !allow_respawn(
-            respawn_tracker,
-            &path,
-            std::time::Instant::now(),
-            RESPAWN_WINDOW,
-            MAX_RESPAWNS,
-        ) {
-            tracing::error!(
-                "worker {} аварийно завершался > {} раз за {} с — перезапуски прекращены, статус «ошибка»",
-                path.display(),
-                MAX_RESPAWNS,
-                RESPAWN_WINDOW.as_secs()
+        let сейчас = std::time::Instant::now();
+        if !allow_respawn(respawn_tracker, &path, сейчас, RESPAWN_WINDOW, MAX_RESPAWNS) {
+            // Окно частых перезапусков исчерпано. Путь НЕ бросается навсегда:
+            // причины бывают временными (каталог исчезает на перевыгрузке
+            // конфигурации, база занята чужим процессом), и без редких повторов
+            // путь оставался бы в «ошибка» до перезапуска демона. Редкая проба
+            // раз в RARE_RETRY_WINDOW лечит такие случаи сама и не крутит цикл.
+            let пора_пробовать = rare_retry_due(rare_retries, &path, сейчас, RARE_RETRY_WINDOW);
+            if !пора_пробовать {
+                // Статус несёт причину, а не только факт: по нему гейт миграции и
+                // `daemon status` показывают, что именно не так с путём.
+                let текст = match last_errors.get(&path) {
+                    Some(причина) => format!(
+                        "worker многократно аварийно завершается — см. журнал демона; последняя причина: {}",
+                        причина
+                    ),
+                    None => "worker многократно аварийно завершается — см. журнал демона".to_string(),
+                };
+                if !rare_reported.insert(path.clone()) {
+                    state.set_error(&path, текст).await;
+                    continue;
+                }
+                tracing::error!(
+                    "worker {} аварийно завершался > {} раз за {} с — перезапуски приостановлены, статус «ошибка», проба раз в {} с{}",
+                    path.display(),
+                    MAX_RESPAWNS,
+                    RESPAWN_WINDOW.as_secs(),
+                    RARE_RETRY_WINDOW.as_secs(),
+                    match last_errors.get(&path) {
+                        Some(текст) => format!("; последняя причина: {}", текст),
+                        None => String::new(),
+                    }
+                );
+                state.set_error(&path, текст).await;
+                continue;
+            }
+            tracing::info!(
+                "worker {}: повторная проба после серии аварийных завершений",
+                path.display()
             );
-            state
-                .set_error(
-                    &path,
-                    "worker многократно аварийно завершается — см. журнал демона",
-                )
-                .await;
-            continue;
+            rare_reported.remove(&path);
+            rare_retries.insert(path.clone(), сейчас);
+            respawn_tracker.remove(&path);
         }
 
         // Честный промежуточный статус до готовности свежего worker'а.
@@ -710,6 +816,25 @@ mod migrate_tests {
         // По прошествии окна счётчик сбрасывается — снова разрешено.
         let later = t0 + std::time::Duration::from_secs(61);
         assert!(allow_respawn(&mut tracker, &path, later, window, 5));
+    }
+
+    /// Путь, исчерпавший частые перезапуски, не бросается навсегда: редкая проба
+    /// лечит временные причины (каталог исчез на перевыгрузке конфигурации) без
+    /// перезапуска демона, но и не превращается в бесконечный цикл.
+    #[test]
+    fn редкая_проба_ждёт_окно_и_повторяется() {
+        let окно = std::time::Duration::from_secs(300);
+        let путь = PathBuf::from("/tmp/repo");
+        let t0 = std::time::Instant::now();
+        let mut tracker = HashMap::new();
+        assert!(rare_retry_due(&tracker, &путь, t0, окно), "первая проба — сразу");
+        tracker.insert(путь.clone(), t0);
+        assert!(!rare_retry_due(&tracker, &путь, t0 + std::time::Duration::from_secs(299), окно));
+        assert!(rare_retry_due(&tracker, &путь, t0 + std::time::Duration::from_secs(300), окно));
+        assert!(
+            rare_retry_due(&tracker, &PathBuf::from("/tmp/иной"), t0, окно),
+            "у каждого пути своё окно"
+        );
     }
 
     #[test]

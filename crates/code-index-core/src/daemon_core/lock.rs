@@ -38,7 +38,7 @@ pub fn acquire_at(pid_path: PathBuf, who: &str) -> Result<DaemonPidLock> {
                 }
             }
         }
-        eprintln!("[lock] Найден устаревший PID-файл, перезаписываем");
+        tracing::warn!("[lock] найден устаревший PID-файл, перезаписываем");
     }
 
     std::fs::write(&pid_path, std::process::id().to_string())?;

@@ -37,28 +37,96 @@ fn storage_mode_ru(mode: &crate::storage::memory::StorageMode) -> &'static str {
     }
 }
 
-/// Есть ли в базе хоть одна запись о файле.
+/// Что показала проба базы перед открытием её на запись.
+///
+/// Отличать «данных нет» от «база не читается» обязательно. Раньше обе
+/// ситуации сходились в один `false`, и путь с готовым индексом, который в
+/// этот момент держал другой процесс (сервер выдачи, CLI-команда, прежний
+/// worker), уходил в ветку «новая база»: демон начинал пересоздавать индекс
+/// поверх существующего, падал на открытии и уходил в цикл перезапусков.
+/// Причину при этом не писал никуда — в журнале оставалось только «worker
+/// завершился сам» (дефект 01.10.2026: mdm, KA-release_01,
+/// ka-upr_obnovlenie-kontura).
+enum DbProbe {
+    /// Файла базы нет — это первая индексация папки.
+    Missing,
+    /// База читается и записи о файлах в ней есть — сверка изменений при старте.
+    HasData,
+    /// База читается, но записей нет: пустышка сервера выдачи или пустой репозиторий.
+    Empty,
+    /// Файл есть, но открыть или прочитать его не удалось. Причина — текстом,
+    /// она идёт и в журнал, и в статус пути.
+    Unreadable(String),
+}
+
+/// Сколько раз пробовать открыть базу и сколько ждать между попытками.
+///
+/// Ждать приходится, когда базу держит кто-то другой: занятость временная и за
+/// считанные секунды проходит. Дольше ждать нельзя — worker держит permit
+/// очереди на первичную индексацию, и затянутое ожидание задержало бы
+/// остальные пути.
+const DB_PROBE_DELAYS_SEC: [u64; 3] = [1, 5, 15];
+
+/// Проба базы с повторами на временной занятости.
 ///
 /// По наличию файла судить нельзя: сервер выдачи при старте создаёт пустые
 /// базы для всех местных папок, чтобы открыть их только на чтение до первой
 /// индексации. Такая пустышка от настоящей базы по имени и размеру не
 /// отличается, и демон принимал первичную индексацию за сверку изменений —
-/// врал в журнале и открывал базу сразу на диске вместо памяти.
-fn db_has_data(db_path: &std::path::Path) -> bool {
+/// врал в журнале и открывал базу сразу на диске вместо памяти. Поэтому вопрос
+/// «есть ли данные» решают записи в таблице files, а не файл на диске.
+fn probe_db(db_path: &std::path::Path) -> DbProbe {
     if !db_path.exists() {
-        return false;
+        return DbProbe::Missing;
     }
-    let Ok(storage) = Storage::open_file_readonly(db_path) else {
-        // Файл нечитаем или это ещё не база — данных в нём для нас нет.
-        return false;
+    let mut last = String::new();
+    for delay in DB_PROBE_DELAYS_SEC {
+        match probe_db_once(db_path) {
+            DbProbe::Unreadable(причина) => {
+                last = причина;
+                tracing::warn!(
+                    "база {} не читается ({}), повтор через {} с",
+                    db_path.display(),
+                    last,
+                    delay
+                );
+                std::thread::sleep(std::time::Duration::from_secs(delay));
+            }
+            ok => return ok,
+        }
+    }
+    DbProbe::Unreadable(last)
+}
+
+fn probe_db_once(db_path: &std::path::Path) -> DbProbe {
+    let storage = match Storage::open_file_readonly(db_path) {
+        Ok(s) => s,
+        Err(e) => return DbProbe::Unreadable(format!("{:#}", e)),
     };
-    storage
+    match storage
         .conn()
         .query_row("SELECT EXISTS(SELECT 1 FROM files)", [], |row| {
             row.get::<_, i64>(0)
-        })
-        .map(|exists| exists != 0)
-        .unwrap_or(false)
+        }) {
+        Ok(0) => DbProbe::Empty,
+        Ok(_) => DbProbe::HasData,
+        Err(e) => DbProbe::Unreadable(format!("запрос к таблице files: {}", e)),
+    }
+}
+
+/// Отметить путь сбойным, оставив причину и в статусе, и в журнале демона.
+///
+/// Сторож worker'ов перезаписывает статус пути своим («worker перезапускается
+/// после аварийного завершения»), поэтому без строки в журнале причина раннего
+/// выхода теряется совсем — именно так дефект «worker завершился сам» и
+/// оставался без объяснения.
+fn fail(state: &DaemonState, path: &std::path::Path, message: impl Into<String>) {
+    let message = message.into();
+    tracing::error!("[{}] worker завершает работу: {}", path.display(), message);
+    let path = path.to_path_buf();
+    tokio_block_on(async {
+        state.set_error(&path, message).await;
+    });
 }
 
 /// Что делать циклу слежения после обработки пакета.
@@ -648,11 +716,7 @@ pub fn run_worker(
     let path = match entry.path.canonicalize() {
         Ok(p) => p,
         Err(e) => {
-            tokio_block_on(async {
-                state
-                    .set_error(&entry.path, format!("Не удалось разрешить путь: {}", e))
-                    .await;
-            });
+            fail(&state, &entry.path, format!("Не удалось разрешить путь: {}", e));
             return;
         }
     };
@@ -661,16 +725,16 @@ pub fn run_worker(
     let db_dir = match crate::index_location::directory_for_entry(&entry) {
         Ok(dir) => dir,
         Err(e) => {
-            tokio_block_on(async { state.set_error(&path, e.to_string()).await });
+            fail(&state, &path, e.to_string());
             return;
         }
     };
     if let Err(e) = std::fs::create_dir_all(&db_dir) {
-        tokio_block_on(async {
-            state
-                .set_error(&path, format!("Создание каталога индекса {}: {}", db_dir.display(), e))
-                .await;
-        });
+        fail(
+            &state,
+            &path,
+            format!("Создание каталога индекса {}: {}", db_dir.display(), e),
+        );
         return;
     }
     let db_path = db_dir.join("index.db");
@@ -679,11 +743,7 @@ pub fn run_worker(
     let mut index_config = match IndexConfig::load_from_dir(&db_dir) {
         Ok(c) => c,
         Err(e) => {
-            tokio_block_on(async {
-                state
-                    .set_error(&path, format!("Загрузка IndexConfig: {}", e))
-                    .await;
-            });
+            fail(&state, &path, format!("Загрузка IndexConfig: {}", e));
             return;
         }
     };
@@ -760,7 +820,19 @@ pub fn run_worker(
     // сети сервер стартует ПОСЛЕ демона, на рабочей станции — раньше).
     // По этому признаку выбирается и режим хранилища, и слова в журнале —
     // иначе одна и та же папка ведёт себя на двух машинах по-разному.
-    let db_has_rows = db_has_data(&db_path);
+    //
+    // Нечитаемая база — это НЕ «новая база»: пересоздавать индекс поверх
+    // существующего нельзя (в нём может лежать готовая работа, которую держит
+    // другой процесс), поэтому такой путь уходит в ошибку с причиной, а сторож
+    // поднимает worker заново.
+    let db_has_rows = match probe_db(&db_path) {
+        DbProbe::HasData => true,
+        DbProbe::Missing | DbProbe::Empty => false,
+        DbProbe::Unreadable(причина) => {
+            fail(&state, &path, format!("База индекса не читается: {}", причина));
+            return;
+        }
+    };
 
     // Паспорт папки: по присланному журналу должно быть видно, с чем работали
     // и при каких настройках, иначе времена не с чем соотнести.
@@ -795,9 +867,7 @@ pub fn run_worker(
         match Storage::open_file(&db_path) {
             Ok(s) => s,
             Err(e) => {
-                tokio_block_on(async {
-                    state.set_error(&path, format!("Storage::open_file: {}", e)).await;
-                });
+                fail(&state, &path, format!("Storage::open_file: {:#}", e));
                 return;
             }
         }
@@ -830,9 +900,7 @@ pub fn run_worker(
         match Storage::open_auto(&db_path, &storage_config) {
             Ok(s) => s,
             Err(e) => {
-                tokio_block_on(async {
-                    state.set_error(&path, format!("Storage::open_auto: {}", e)).await;
-                });
+                fail(&state, &path, format!("Storage::open_auto: {:#}", e));
                 return;
             }
         }
@@ -928,9 +996,7 @@ pub fn run_worker(
             result
         }
         Err(e) => {
-            tokio_block_on(async {
-                state.set_error(&path, format!("full_reindex: {}", e)).await;
-            });
+            fail(&state, &path, format!("full_reindex: {:#}", e));
             return;
         }
     };
@@ -1050,9 +1116,7 @@ pub fn run_worker(
         storage = match Storage::open_file(&db_path) {
             Ok(s) => s,
             Err(e) => {
-                tokio_block_on(async {
-                    state.set_error(&path, format!("Storage::open_file (disk reopen): {}", e)).await;
-                });
+                fail(&state, &path, format!("Storage::open_file (disk reopen): {:#}", e));
                 return;
             }
         };
@@ -1183,9 +1247,7 @@ pub fn run_worker(
     let (watcher, rx) = match create_watcher(&path, &watcher_config) {
         Ok(pair) => pair,
         Err(e) => {
-            tokio_block_on(async {
-                state.set_error(&path, format!("create_watcher: {}", e)).await;
-            });
+            fail(&state, &path, format!("create_watcher: {}", e));
             return;
         }
     };
@@ -1631,12 +1693,15 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let db = tmp.path().join("index.db");
 
-        assert!(!db_has_data(&db), "файла ещё нет — данных нет");
+        assert!(matches!(probe_db(&db), DbProbe::Missing), "файла ещё нет — базы нет");
 
         // Ровно то, что делает сервер выдачи: создать файл со схемой и закрыть.
         drop(Storage::open_file(&db).unwrap());
         assert!(db.exists(), "файл базы создан");
-        assert!(!db_has_data(&db), "схема без записей — это не проиндексированная папка");
+        assert!(
+            matches!(probe_db(&db), DbProbe::Empty),
+            "схема без записей — это не проиндексированная папка"
+        );
 
         let storage = Storage::open_file(&db).unwrap();
         storage
@@ -1647,7 +1712,33 @@ mod tests {
             )
             .unwrap();
         drop(storage);
-        assert!(db_has_data(&db), "появилась запись о файле — база рабочая");
+        assert!(
+            matches!(probe_db(&db), DbProbe::HasData),
+            "появилась запись о файле — база рабочая"
+        );
+    }
+
+    /// База есть, но открыть её нельзя — это НЕ «новая база».
+    ///
+    /// Разница принципиальная: «новая база» запускает пересоздание индекса
+    /// поверх существующего, а нечитаемая база обязана уйти в ошибку с
+    /// причиной (дефект 01.10.2026: демон принимал занятую базу за новую,
+    /// ронял worker и не писал, почему).
+    #[test]
+    fn нечитаемая_база_не_считается_новой() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = tmp.path().join("index.db");
+        std::fs::write(&db, b"not a sqlite database at all").unwrap();
+
+        match probe_db(&db) {
+            DbProbe::Unreadable(причина) => {
+                assert!(!причина.is_empty(), "причина отказа должна быть названа")
+            }
+            другое => panic!(
+                "нечитаемая база должна вернуть Unreadable, а не {:?}",
+                std::mem::discriminant(&другое)
+            ),
+        }
     }
 }
 

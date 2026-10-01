@@ -1571,6 +1571,20 @@ pub async fn get_file_summary(entry: &RepoEntry, path: String) -> String {
 /// (диспатчер не должен сюда попадать). get_stats остаётся диагностическим:
 /// возвращает данные даже если папка не Ready.
 async fn local_stats(alias: &str, entry: &RepoEntry) -> serde_json::Value {
+    // Путь без открытой базы отвечает причиной, а не паникой: `get_stats` ходит
+    // в репо-карту напрямую (минуя `resolve_repo`) и в том числе веером по всем
+    // репо — один сбойный путь не должен ронять выдачу остальных.
+    if let Some(причина) = entry.unavailable.as_ref() {
+        return serde_json::json!({
+            "repo": alias,
+            "error": format!("репо недоступен: {}", причина),
+            "path": entry
+                .root_path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+        });
+    }
     let root = entry.local_root();
     let path_info = client::path_status_async(root).await.ok();
     let storage = match entry.storage_pool().get().await {
@@ -1656,15 +1670,11 @@ pub async fn one_stats(
 /// Полная сводка: для одного `repo` или fan-out по всем подключённым.
 pub async fn get_stats(server: &CodeIndexServer, repo: Option<String>) -> String {
     if let Some(alias) = repo {
-        return match server.repos.get(&alias) {
-            Some(entry) => to_json(&one_stats(server, &alias, entry).await),
-            None => format_unavailable(ToolUnavailable::UnknownRepo {
-                message: format!(
-                    "Неизвестный repo '{}'. Доступные: {:?}.",
-                    alias,
-                    server.repo_aliases()
-                ),
-            }),
+        // Через `resolve_repo`: по недоступному пути статистики нет, и об этом
+        // надо сказать причиной, а не паникой в пуле соединений.
+        return match server.resolve_repo(&alias) {
+            Ok(entry) => to_json(&one_stats(server, &alias, entry).await),
+            Err(json) => json,
         };
     }
 

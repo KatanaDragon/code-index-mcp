@@ -94,7 +94,7 @@ impl CacheClient {
                         } else {
                             let body_text =
                                 resp.text().await.unwrap_or_else(|_| "<no body>".into());
-                            eprintln!(
+                            tracing::warn!(
                                 "[cache_client] {} non-2xx ({}): {}",
                                 url, status, body_text
                             );
@@ -102,7 +102,7 @@ impl CacheClient {
                         }
                     }
                     Err(e) => {
-                        eprintln!("[cache_client] {} send error: {}", url, e);
+                        tracing::warn!("[cache_client] {} send error: {}", url, e);
                         false
                     }
                 }
@@ -153,7 +153,7 @@ impl CacheClient {
                             // best-effort, invalidate после commit подстрахует.
                             let body_text =
                                 resp.text().await.unwrap_or_else(|_| "<no body>".into());
-                            eprintln!(
+                            tracing::warn!(
                                 "[cache_client] {} non-2xx ({}): {}",
                                 url, status, body_text
                             );
@@ -161,7 +161,7 @@ impl CacheClient {
                         }
                     }
                     Err(e) => {
-                        eprintln!("[cache_client] {} send error: {}", url, e);
+                        tracing::warn!("[cache_client] {} send error: {}", url, e);
                         false
                     }
                 }
