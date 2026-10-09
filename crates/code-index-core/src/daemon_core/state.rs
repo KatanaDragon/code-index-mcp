@@ -300,9 +300,9 @@ mod tests {
     use super::*;
 
     /// Минимальная запись `[[paths]]` для тестов состояния.
-    fn entry(path: &str) -> PathEntry {
+    fn entry(path: impl AsRef<std::path::Path>) -> PathEntry {
         PathEntry {
-            path: PathBuf::from(path),
+            path: path.as_ref().to_path_buf(),
             index_dir: None,
             debounce_ms: None,
             batch_ms: None,
@@ -313,12 +313,23 @@ mod tests {
         }
     }
 
+    /// Ключ, под которым запись попадает в состояние: та же упрощённая
+    /// канонизация, что и в `apply_config`.
+    fn key(p: &std::path::Path) -> PathBuf {
+        crate::paths::canonicalize(p)
+    }
+
+    /// Пути берём под временным каталогом, а не литералами вида `/a`: на
+    /// windows-latest рабочая папка — `D:\a\…`, поэтому `canonicalize("/a")`
+    /// разрешается в существующий `D:\a` и ключ перестаёт совпадать с ожидаемым.
     #[tokio::test]
     async fn apply_config_tracks_diff() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (a, b, c) = (tmp.path().join("a"), tmp.path().join("b"), tmp.path().join("c"));
         let st = DaemonState::new();
 
         let out = st
-            .apply_config(&[entry("/a"), entry("/b")])
+            .apply_config(&[entry(&a), entry(&b)])
             .await;
         assert_eq!(out.added.len(), 2);
         assert_eq!(out.removed.len(), 0);
@@ -326,12 +337,12 @@ mod tests {
         assert_eq!(out.unchanged.len(), 0);
 
         let out = st
-            .apply_config(&[entry("/b"), entry("/c")])
+            .apply_config(&[entry(&b), entry(&c)])
             .await;
-        assert_eq!(out.added, vec![PathBuf::from("/c")]);
-        assert_eq!(out.removed, vec![PathBuf::from("/a")]);
+        assert_eq!(out.added, vec![key(&c)]);
+        assert_eq!(out.removed, vec![key(&a)]);
         assert_eq!(out.changed.len(), 0);
-        assert_eq!(out.unchanged, vec![PathBuf::from("/b")]);
+        assert_eq!(out.unchanged, vec![key(&b)]);
     }
 
     /// Приёмка 7б: `reload` видит смену `index_dir` у существующего пути.
@@ -339,18 +350,20 @@ mod tests {
     /// в `unchanged` — воркер продолжал писать в старый.
     #[tokio::test]
     async fn apply_config_detects_index_dir_change() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
         let st = DaemonState::new();
-        st.apply_config(&[entry("/repo")]).await;
+        st.apply_config(&[entry(&repo)]).await;
 
-        let same = st.apply_config(&[entry("/repo")]).await;
+        let same = st.apply_config(&[entry(&repo)]).await;
         assert!(same.changed.is_empty(), "без правок путь не менялся: {:?}", same.changed);
-        assert_eq!(same.unchanged, vec![PathBuf::from("/repo")]);
+        assert_eq!(same.unchanged, vec![key(&repo)]);
 
-        let mut moved = entry("/repo");
-        moved.index_dir = Some(PathBuf::from("/indexes/repo"));
+        let mut moved = entry(&repo);
+        moved.index_dir = Some(tmp.path().join("indexes").join("repo"));
         let out = st.apply_config(&[moved.clone()]).await;
 
-        assert_eq!(out.changed, vec![PathBuf::from("/repo")]);
+        assert_eq!(out.changed, vec![key(&repo)]);
         assert!(out.unchanged.is_empty());
         assert!(out.added.is_empty());
 
@@ -358,27 +371,30 @@ mod tests {
         // снимок обновился.
         let again = st.apply_config(&[moved]).await;
         assert!(again.changed.is_empty());
-        assert_eq!(again.unchanged, vec![PathBuf::from("/repo")]);
+        assert_eq!(again.unchanged, vec![key(&repo)]);
     }
 
     /// `alias` демон игнорирует — правка `alias` не должна перезапускать воркер.
     #[tokio::test]
     async fn apply_config_ignores_alias_change() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
         let st = DaemonState::new();
-        st.apply_config(&[entry("/repo")]).await;
+        st.apply_config(&[entry(&repo)]).await;
 
-        let mut renamed = entry("/repo");
+        let mut renamed = entry(&repo);
         renamed.alias = Some("widgets".into());
         let out = st.apply_config(&[renamed]).await;
         assert!(out.changed.is_empty(), "alias не влияет на воркер: {:?}", out.changed);
-        assert_eq!(out.unchanged, vec![PathBuf::from("/repo")]);
+        assert_eq!(out.unchanged, vec![key(&repo)]);
     }
 
     #[tokio::test]
     async fn set_ready_clears_progress() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = key(&tmp.path().join("a"));
         let st = DaemonState::new();
-        let path = PathBuf::from("/a");
-        st.apply_config(&[entry("/a")]).await;
+        st.apply_config(&[entry(&path)]).await;
         st.set_status(&path, PathStatus::InitialIndexing).await;
         st.set_progress(&path, Progress::new(10, 100)).await;
 
