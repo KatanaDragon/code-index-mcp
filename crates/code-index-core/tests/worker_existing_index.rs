@@ -143,6 +143,75 @@ async fn готовый_индекс_не_пересобирается_и_не_�
     drop(tmp);
 }
 
+/// Корень репозитория отсутствует (идёт перевыгрузка), индекс — в центральном
+/// каталоге. worker обязан остановиться с причиной и НЕ трогать базу: полный
+/// проход по отсутствующему дереву не видит файлов и своим этапом 5 удалил бы
+/// все записи пути.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn отсутствующий_корень_останавливает_worker_и_не_вытирает_индекс() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+
+    // Центральный каталог индекса, как в боевом конфиге (`index_dir` вне репо).
+    let idx = tmp.path().join("indexes").join("repo");
+    std::fs::create_dir_all(&idx).unwrap();
+    let db = idx.join("index.db");
+    {
+        let storage = Storage::open_file(&db).unwrap();
+        storage
+            .conn()
+            .execute(
+                "INSERT INTO files (path, content_hash, language, mtime, file_size) \
+                 VALUES ('модуль.bsl', 'hash', 'bsl', 1, 10)",
+                [],
+            )
+            .unwrap();
+    }
+
+    // Репозиторий исчез — ровно случай «идёт перевыгрузка».
+    std::fs::remove_dir_all(&repo).unwrap();
+
+    let state = DaemonState::new();
+    let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+    let mut e = entry(&repo);
+    e.index_dir = Some(idx.clone());
+    let canonical = code_index_core::paths::canonicalize(&repo);
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let handle = tokio::task::spawn_blocking({
+        let state = state.clone();
+        move || run_worker(e, state, shutdown_rx, stop, None, IndexerSection::default(), None, None)
+    });
+
+    let статус = ждать_статус(&state, &canonical, PathStatus::Error, Duration::from_secs(30)).await;
+    assert_eq!(статус, PathStatus::Error, "отсутствующий корень — ошибка пути");
+
+    // Главное — индекс не тронут: запись на месте. Проверяем ДО разбора причины,
+    // потому что именно вытирание базы и есть тот ущерб, ради которого стоит
+    // защита (сообщение об ошибке — уже следствие).
+    let storage = Storage::open_file_readonly(&db).unwrap();
+    let осталось: i64 = storage
+        .conn()
+        .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(осталось, 1, "индекс отсутствующего репозитория вытерт");
+
+    let причина = state
+        .get(&canonical)
+        .await
+        .and_then(|r| r.error)
+        .expect("причина обязана попасть в статус пути");
+    assert!(
+        причина.contains("Путь недоступен"),
+        "причина должна называть отсутствие каталога, получено: {}",
+        причина
+    );
+
+    let _ = shutdown_tx.send(());
+    let _ = tokio::time::timeout(Duration::from_secs(10), handle).await;
+    drop(tmp);
+}
+
 /// База есть, но не читается: worker обязан назвать причину, а не умереть
 /// молча, и не тронуть файл базы (в ней может лежать готовая работа).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
