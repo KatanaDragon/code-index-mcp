@@ -734,22 +734,22 @@ fn finish_batch(
 /// используется, cache-ci работает только по TTL fallback. Если задан — после
 /// каждого успешного `commit_batch()` worker асинхронно шлёт
 /// `POST /invalidate {file_paths: [...]}` со списком файлов batch'а.
+#[allow(clippy::too_many_arguments)]
 pub fn run_worker(
     entry: PathEntry,
     state: DaemonState,
     mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
     initial_limiter: Option<Arc<Semaphore>>,
     indexer_section: IndexerSection,
     processor_registry: Option<Arc<ProcessorRegistry>>,
     cache_client: Option<Arc<CacheClient>>,
 ) {
-    let path = match entry.path.canonicalize() {
-        Ok(p) => p,
-        Err(e) => {
-            fail(&state, &entry.path, format!("Не удалось разрешить путь: {}", e));
-            return;
-        }
-    };
+    // I/O: этот путь идёт в create_dir_all каталога индекса, в ключ состояния
+    // (`set_status`/`fail`) и в SQLite. Именно verbatim-форма (`\\?\`) роняла
+    // запись на узле с фильтр-стеком: каталог и сателлиты SQLite не создавались,
+    // а чтение продолжало работать — отсюда «висел готовым неделями».
+    let path = crate::paths::canonicalize(&entry.path);
 
     // 1. Открыть/создать индекс по настройке этого пути.
     let db_dir = match crate::index_location::directory_for_entry(&entry) {
@@ -763,7 +763,12 @@ pub fn run_worker(
         fail(
             &state,
             &path,
-            format!("Создание каталога индекса {}: {}", db_dir.display(), e),
+            format!(
+                "Создание каталога индекса {}: {}{}",
+                db_dir.display(),
+                e,
+                crate::paths::verbatim_hint(&db_dir)
+            ),
         );
         return;
     }
@@ -826,6 +831,17 @@ pub fn run_worker(
             return;
         }
     };
+
+    // Персональный стоп-сигнал: `daemon reload` меняет конфигурацию пути
+    // (например, `index_dir`) и останавливает ЭТОТ воркер, чтобы поднять заново
+    // с новым каталогом. Общий broadcast тут не годится — он гасит все папки.
+    // Проверяем до открытия базы и до первичной индексации: писать в старый
+    // каталог уже нельзя, а открывать на запись базу, которую вот-вот сменит
+    // новый воркер, — тем более.
+    if stop_requested(&stop) {
+        tracing::info!("[{}] получен стоп-сигнал до открытия базы — worker завершается", path.display());
+        return;
+    }
 
     // 4. Выставить статус InitialIndexing ПОСЛЕ получения permit — иначе
     // папки-кандидаты показываются как активно индексируются, хотя на самом
@@ -897,7 +913,11 @@ pub fn run_worker(
         match Storage::open_file(&db_path) {
             Ok(s) => s,
             Err(e) => {
-                fail(&state, &path, format!("Storage::open_file: {:#}", e));
+                fail(
+                    &state,
+                    &path,
+                    format!("Storage::open_file: {:#}{}", e, crate::paths::verbatim_hint(&db_path)),
+                );
                 return;
             }
         }
@@ -930,7 +950,11 @@ pub fn run_worker(
         match Storage::open_auto(&db_path, &storage_config) {
             Ok(s) => s,
             Err(e) => {
-                fail(&state, &path, format!("Storage::open_auto: {:#}", e));
+                fail(
+                    &state,
+                    &path,
+                    format!("Storage::open_auto: {:#}{}", e, crate::paths::verbatim_hint(&db_path)),
+                );
                 return;
             }
         }
@@ -1322,7 +1346,10 @@ pub fn run_worker(
         std::collections::HashMap::new();
 
     loop {
-        if shutdown_received(&mut shutdown_rx) {
+        // Общий shutdown демона либо персональный стоп (перезапуск одного пути
+        // на reload). Idle-таймаут poll_batch — 500 мс, столько же максимум
+        // воркер может не замечать сигнал, стоя в ожидании событий.
+        if shutdown_received(&mut shutdown_rx) || stop_requested(&stop) {
             break;
         }
 
@@ -1774,6 +1801,12 @@ mod tests {
 
 fn shutdown_received(rx: &mut tokio::sync::broadcast::Receiver<()>) -> bool {
     matches!(rx.try_recv(), Ok(()))
+}
+
+/// Запрошен ли персональный стоп этого воркера (перезапуск одного пути при
+/// `daemon reload`). Флаг ставит runner перед подъёмом воркера заново.
+fn stop_requested(stop: &std::sync::atomic::AtomicBool) -> bool {
+    stop.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Собрать список относительных file_path из batch'а FS-событий для отправки

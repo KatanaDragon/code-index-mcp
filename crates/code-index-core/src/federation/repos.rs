@@ -62,9 +62,11 @@ pub fn merge(
         if is_local {
             match local_paths.get(&entry.alias) {
                 Some(raw_path) => {
-                    let root = raw_path
-                        .canonicalize()
-                        .unwrap_or_else(|_| raw_path.clone());
+                    // I/O и наружу: canonical-корень попадает в
+                    // `FederatedRepo.root_path` → MCP-ответы (`repos`, `get_stats`),
+                    // а `db_path` строится через `directory_for_entry`. Verbatim
+                    // здесь и утёк бы наружу, и сломал бы открытие базы.
+                    let root = crate::paths::canonicalize(raw_path);
                     let db = crate::index_location::directory_for_entry(
                         daemon.paths.iter().find(|p| p.effective_alias() == entry.alias).unwrap()
                     )?.join("index.db");
@@ -183,6 +185,35 @@ mod tests {
         assert!(r.db_path.is_some());
         let db = r.db_path.as_ref().unwrap();
         assert!(db.ends_with(".code-index/index.db") || db.ends_with(".code-index\\index.db"));
+    }
+
+    /// Приёмка 7в: пути, собираемые для федерации (корень локального репо и
+    /// `db_path`), не несут verbatim-префикса — иначе `\\?\` утёк бы в
+    /// MCP-ответы (`repos`, `get_stats`) и в открытие SQLite.
+    #[test]
+    fn local_paths_have_no_verbatim_prefix() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let s = serve("192.0.2.10", vec![("ut", "192.0.2.10")]);
+        let d = daemon(vec![(root.to_str().unwrap(), "ut")]);
+        let merged = merge(&s, &d).unwrap();
+
+        let r = &merged[0];
+        let root_path = r.root_path.clone().expect("локальный корень известен");
+        let db_path = r.db_path.clone().expect("db_path построен");
+        assert!(
+            !crate::paths::is_verbatim(&root_path),
+            "root_path в verbatim-форме: {}",
+            root_path.display()
+        );
+        assert!(
+            !crate::paths::is_verbatim(&db_path),
+            "db_path в verbatim-форме: {}",
+            db_path.display()
+        );
+        assert_eq!(db_path, root_path.join(".code-index").join("index.db"));
     }
 
     #[test]

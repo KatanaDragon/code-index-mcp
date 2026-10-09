@@ -2,6 +2,7 @@
 // Каждый модуль будет реализован в соответствующем шаге плана
 
 pub mod cli;            // CLI-обёртка (вызывается из bin'ов code-index и bsl-indexer)
+pub mod paths;          // Канонизация путей без Windows-verbatim-префикса (единый хелпер)
 pub mod index_location; // Расположение базы индекса для демона, serve и CLI
 pub mod logging;        // Журнал долгоживущих процессов: stderr + файл с ротацией
 pub mod storage;        // SQLite-хранилище индекса

@@ -8,6 +8,7 @@
 //! worker'а.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use code_index_core::daemon_core::config::{IndexerSection, PathEntry};
@@ -82,10 +83,14 @@ fn поднять_worker(
     let state = DaemonState::new();
     let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
     let entry = entry(root);
-    let canonical = entry.path.canonicalize().unwrap();
+    // Приёмка 7а: путь — тем же хелпером, что и воркер. На Windows
+    // `std::fs::canonicalize` вернул бы verbatim `\\?\…`, и ключ статуса не
+    // совпал бы с тем, под которым пишет воркер.
+    let canonical = code_index_core::paths::canonicalize(&entry.path);
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let handle = tokio::task::spawn_blocking({
         let state = state.clone();
-        move || run_worker(entry, state, shutdown_rx, None, IndexerSection::default(), None, None)
+        move || run_worker(entry, state, shutdown_rx, stop, None, IndexerSection::default(), None, None)
     });
     (handle, state, shutdown_tx, canonical)
 }

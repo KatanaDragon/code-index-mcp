@@ -203,10 +203,8 @@ async fn reload_from_disk(server: &CodeIndexServer, daemon_toml_path: &Path) -> 
                 active.insert(lang.clone());
             }
             None => {
-                let root = entry
-                    .path
-                    .canonicalize()
-                    .unwrap_or_else(|_| entry.path.clone());
+                // I/O-чтение для detect_language (обход маркеров корня).
+                let root = crate::paths::canonicalize(&entry.path);
                 if let Some(lang) = crate::daemon_core::language_detect::detect_language(&root) {
                     tracing::info!(
                         "config_watch: язык для {} не задан, определён автоматически: {}",
@@ -289,6 +287,7 @@ mod tests {
     /// инструменты языка не появлялись в перечне вовсе. Теперь язык
     /// определяется тем же автоопределением, что и у демона.
     #[tokio::test]
+    #[allow(clippy::disallowed_methods)] // канонизация в тесте — для сравнения с самим собой
     async fn язык_без_явной_настройки_определяется_автоматически() {
         let tmp = TempDir::new().unwrap();
 

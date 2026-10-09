@@ -125,7 +125,7 @@ pub struct PathStatusResponse {
 
 // ── POST /reload ─────────────────────────────────────────────────────────────
 
-/// Ответ `POST /reload`: диагностика — какие папки добавились/убрались.
+/// Ответ `POST /reload`: диагностика — какие папки добавились/убрались/изменились.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReloadResponse {
     pub reloaded: bool,
@@ -133,6 +133,11 @@ pub struct ReloadResponse {
     pub added: Vec<PathBuf>,
     /// Пути, которые были но убраны из конфига.
     pub removed: Vec<PathBuf>,
+    /// Пути, у которых изменились значимые поля записи (`index_dir`,
+    /// `debounce_ms`, `batch_ms`, `language`, лимиты). Их воркер перезапущен
+    /// с новой конфигурацией.
+    #[serde(default)]
+    pub changed: Vec<PathBuf>,
     /// Пути, которые остались без изменений.
     pub unchanged: Vec<PathBuf>,
     /// Сообщение об ошибке чтения конфига, если reload провалился.

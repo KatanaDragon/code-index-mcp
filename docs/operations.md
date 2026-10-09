@@ -41,7 +41,7 @@
 "C:/tools/code-index/bsl-indexer.exe" daemon reload
 ```
 
-Эта команда делает `POST http://127.0.0.1:<http_port>/reload` на живой daemon (порт берётся из `daemon.json`). Конфиг перечитывается **за миллисекунды**, без kill, без spawn, без stale PID-lock, без потерянных child-handle. Все ранее проиндексированные репо остаются ready, новые попадают в очередь индексации.
+Эта команда делает `POST http://127.0.0.1:<http_port>/reload` на живой daemon (порт берётся из `daemon.json`). Конфиг перечитывается **за миллисекунды**, без kill, без spawn, без stale PID-lock, без потерянных child-handle. Все ранее проиндексированные репо остаются ready, новые попадают в очередь индексации, а у кого изменилось значимое поле записи (`index_dir`, `debounce_ms`, `batch_ms`, `language`, лимиты размера/порога) — воркер перезапускается с новым конфигом. Ответ (и журнал) различает категории `added`/`changed`/`removed`/`unchanged`: если после правки `index_dir` путь оказался в `unchanged`, конфиг не доехал — проверьте файл и `CODE_INDEX_HOME`.
 
 **Полный CLI daemon'a (`bsl-indexer.exe daemon --help`):**
 - `daemon run` — foreground запуск (для Scheduled Task / systemd, не для ручного вызова)

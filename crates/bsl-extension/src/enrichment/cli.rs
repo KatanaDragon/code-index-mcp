@@ -87,9 +87,10 @@ pub async fn run_cli(argv: Vec<String>) -> Result<()> {
 
     // Сверка подписи с уже сохранённой в БД. На warning-mismatch уведомляем
     // оператора, но продолжаем (он сам решит, нужен ли --reenrich).
-    let abs_path = Path::new(&args.path)
-        .canonicalize()
-        .unwrap_or_else(|_| PathBuf::from(&args.path));
+    // I/O: `db_for_path` открывает БД на запись, в неё пишет enrichment — тот же
+    // класс дефекта, что и в демоне, поэтому путь берём общим хелпером ядра
+    // (без Windows-verbatim-префикса).
+    let abs_path = code_index_core::paths::canonicalize(Path::new(&args.path));
     let db_path = code_index_core::index_location::db_for_path(&abs_path, args.config.as_deref())?;
     if !db_path.exists() {
         return Err(anyhow!(

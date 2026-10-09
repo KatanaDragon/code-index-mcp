@@ -28,8 +28,10 @@ pub fn validate_entries(entries: &[PathEntry]) -> Result<()> {
 }
 
 fn normalized(path: &Path) -> String {
-    path.canonicalize()
-        .unwrap_or_else(|_| path.to_path_buf())
+    // Канонизация здесь — только для СРАВНЕНИЯ (приведение разных написаний
+    // одного пути к одному ключу), в ФС по результату не ходим. Семантику не
+    // меняем: verbatim-префикс снимается, дальше lowercase и прямые слеши.
+    crate::paths::canonicalize(path)
         .to_string_lossy()
         .replace('\\', "/")
         .trim_end_matches('/')
@@ -37,7 +39,10 @@ fn normalized(path: &Path) -> String {
 }
 
 pub fn directory_for_entry(entry: &PathEntry) -> Result<PathBuf> {
-    let root = entry.path.canonicalize().unwrap_or_else(|_| entry.path.clone());
+    // I/O: от корня строится внутренний каталог `.code-index` и проверяется
+    // наличие старого каталога, поэтому путь обязан быть в обычной форме —
+    // verbatim-путь ломает создание каталога и сателлитов SQLite на Windows.
+    let root = crate::paths::canonicalize(&entry.path);
     match &entry.index_dir {
         Some(dir) => {
             if !dir.is_absolute() {
@@ -121,6 +126,49 @@ mod tests {
             other.display().to_string().replace('\\', "/"),
             outside.display().to_string().replace('\\', "/"));
         assert!(config::parse_str(&cfg).is_err());
+    }
+
+    /// Приёмка 7а: построенный каталог индекса не несёт verbatim-префикса —
+    /// ни во внутренней ветке, ни в ветке `index_dir`. На Windows именно
+    /// `\\?\`-форма ломала создание каталога и сателлитов SQLite.
+    #[test]
+    fn built_directory_has_no_verbatim_prefix() {
+        let base = std::env::temp_dir().join(format!("code-index-verbatim-{}", std::process::id()));
+        let root = base.join("source");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let entry_no_dir = PathEntry {
+            path: root.clone(),
+            index_dir: None,
+            debounce_ms: None,
+            batch_ms: None,
+            alias: None,
+            language: None,
+            max_code_file_size_bytes: None,
+            bulk_batch_threshold: None,
+        };
+        let internal = directory_for_entry(&entry_no_dir).unwrap();
+        assert!(
+            !crate::paths::is_verbatim(&internal),
+            "внутренний каталог индекса в verbatim-форме: {}",
+            internal.display()
+        );
+        assert!(internal.ends_with(".code-index"));
+
+        let target = base.join("indexes").join("one");
+        let entry_with_dir = PathEntry {
+            index_dir: Some(target.clone()),
+            ..entry_no_dir
+        };
+        let external = directory_for_entry(&entry_with_dir).unwrap();
+        assert_eq!(external, target);
+        assert!(
+            !crate::paths::is_verbatim(&external),
+            "каталог из index_dir в verbatim-форме: {}",
+            external.display()
+        );
+
+        std::fs::remove_dir_all(&base).ok();
     }
 
     #[test]

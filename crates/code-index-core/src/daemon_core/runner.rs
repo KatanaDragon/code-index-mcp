@@ -131,14 +131,14 @@ pub async fn run(processor_registry: Option<Arc<ProcessorRegistry>>) -> Result<(
     };
 
     // Зарегистрировать пути в state и запустить worker'ы.
-    let wanted_canon: Vec<PathBuf> = cfg
-        .paths
-        .iter()
-        .map(|p| p.path.canonicalize().unwrap_or_else(|_| p.path.clone()))
-        .collect();
-    daemon_state.apply_config(&wanted_canon).await;
+    //
+    // Ключи состояния строит сам `apply_config` — упрощённой канонизацией
+    // (без Windows-verbatim `\\?\`), той же, что и worker для своего пути.
+    // Разная форма ключа в двух местах разнесла бы статус: воркер записал бы
+    // под один ключ, а `/health` читал бы под другой.
+    daemon_state.apply_config(&cfg.paths).await;
 
-    let mut workers: HashMap<PathBuf, tokio::task::JoinHandle<()>> = HashMap::new();
+    let mut workers: HashMap<PathBuf, WorkerSlot> = HashMap::new();
     // Копии PathEntry по каноническому пути — чтобы сторож ниже мог перезапустить
     // упавший/аварийно завершившийся worker с той же конфигурацией.
     let mut worker_entries: HashMap<PathBuf, PathEntry> = HashMap::new();
@@ -172,12 +172,11 @@ pub async fn run(processor_registry: Option<Arc<ProcessorRegistry>>) -> Result<(
     };
 
     for entry in cfg.paths.into_iter() {
-        let canonical = entry
-            .path
-            .canonicalize()
-            .unwrap_or_else(|_| entry.path.clone());
+        // I/O-ключ: тот же упрощённый путь, что строит сам воркер, и тот же,
+        // что положил `apply_config` — иначе сторож и `/health` не найдут поток.
+        let canonical = crate::paths::canonicalize(&entry.path);
         worker_entries.insert(canonical.clone(), entry.clone());
-        let handle = spawn_worker(
+        let slot = spawn_worker(
             entry,
             daemon_state.clone(),
             shutdown_tx.subscribe(),
@@ -186,7 +185,7 @@ pub async fn run(processor_registry: Option<Arc<ProcessorRegistry>>) -> Result<(
             processor_registry.clone(),
             cache_client.clone(),
         );
-        workers.insert(canonical, handle);
+        workers.insert(canonical, slot);
     }
 
     // Сторож worker'ов тикает раз в 5 секунд — ищет аварийно завершившиеся потоки
@@ -213,8 +212,11 @@ pub async fn run(processor_registry: Option<Arc<ProcessorRegistry>>) -> Result<(
                             &daemon_state,
                             &mut workers,
                             &mut worker_entries,
+                            &mut respawn_tracker,
+                            &mut rare_retries,
+                            &mut rare_reported,
                             &shutdown_tx,
-                            processor_registry.clone(),
+                            &processor_registry,
                         ).await;
                         let _ = respond_to.send(resp);
                     }
@@ -259,8 +261,8 @@ pub async fn run(processor_registry: Option<Arc<ProcessorRegistry>>) -> Result<(
 
     tracing::info!("остановка worker'ов...");
     let _ = shutdown_tx.send(());
-    for (path, handle) in workers {
-        if let Err(e) = handle.await {
+    for (path, slot) in workers {
+        if let Err(e) = slot.handle.await {
             tracing::warn!(
                 "worker {} не завершился корректно: {}",
                 path.display(),
@@ -393,6 +395,18 @@ fn format_pulse(uptime_sec: u64, memory: &str, snapshot: &[PathPulse]) -> Vec<St
     lines
 }
 
+/// Поток воркера одной папки вместе с персональным стоп-сигналом.
+///
+/// `Handle::abort()` блокирующий `spawn_blocking`-поток посреди работы не
+/// останавливает, поэтому останавливаем воркер кооперативно: runner ставит
+/// `stop`, а воркер проверяет флаг в своём цикле и выходит (см. `worker`).
+/// Так `daemon reload` перезапускает ОДИН изменившийся путь, не трогая
+/// остальные папки.
+struct WorkerSlot {
+    handle: tokio::task::JoinHandle<()>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+}
+
 fn spawn_worker(
     entry: PathEntry,
     state: DaemonState,
@@ -401,18 +415,22 @@ fn spawn_worker(
     indexer_section: IndexerSection,
     processor_registry: Option<Arc<ProcessorRegistry>>,
     cache_client: Option<Arc<CacheClient>>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::task::spawn_blocking(move || {
+) -> WorkerSlot {
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_for_worker = stop.clone();
+    let handle = tokio::task::spawn_blocking(move || {
         worker::run_worker(
             entry,
             state,
             shutdown_rx,
+            stop_for_worker,
             initial_limiter,
             indexer_section,
             processor_registry,
             cache_client,
         );
-    })
+    });
+    WorkerSlot { handle, stop }
 }
 
 /// Решение backoff для перезапуска пути. Обновляет счётчик в `tracker` и
@@ -463,7 +481,7 @@ fn rare_retry_due(
 #[allow(clippy::too_many_arguments)]
 async fn supervise_workers(
     state: &DaemonState,
-    workers: &mut HashMap<PathBuf, tokio::task::JoinHandle<()>>,
+    workers: &mut HashMap<PathBuf, WorkerSlot>,
     worker_entries: &HashMap<PathBuf, PathEntry>,
     respawn_tracker: &mut HashMap<PathBuf, (u32, std::time::Instant)>,
     last_errors: &mut HashMap<PathBuf, String>,
@@ -486,7 +504,7 @@ async fn supervise_workers(
     // Сначала собрать пути завершившихся потоков, потом мутировать `workers`.
     let finished: Vec<PathBuf> = workers
         .iter()
-        .filter(|(_, h)| h.is_finished())
+        .filter(|(_, slot)| slot.handle.is_finished())
         .map(|(p, _)| p.clone())
         .collect();
 
@@ -503,8 +521,8 @@ async fn supervise_workers(
             last_errors.insert(path.clone(), текст.clone());
         }
 
-        if let Some(handle) = workers.remove(&path) {
-            match handle.await {
+        if let Some(slot) = workers.remove(&path) {
+            match slot.handle.await {
                 Ok(()) => match причина.as_ref() {
                     Some(текст) => tracing::warn!(
                         "worker {} завершился сам (не по команде остановки) — перезапуск; причина: {}",
@@ -589,7 +607,7 @@ async fn supervise_workers(
             .set_error(&path, "worker перезапускается после аварийного завершения")
             .await;
 
-        let handle = spawn_worker(
+        let slot = spawn_worker(
             entry,
             state.clone(),
             shutdown_tx.subscribe(),
@@ -598,19 +616,29 @@ async fn supervise_workers(
             processor_registry.clone(),
             cache_client.clone(),
         );
-        workers.insert(path, handle);
+        workers.insert(path, slot);
     }
 }
 
-/// Обработка `POST /reload` в runner'е. Добавляем новые папки и запускаем для них
-/// worker'ы. Удаление папок в MVP требует рестарта демона — это зафиксировано в
-/// брифе и в поле `error` ответа.
+/// Обработка `POST /reload` в runner'е. Добавляем новые папки, перезапускаем
+/// изменённые и запускаем для них worker'ы. Удаление папок в MVP требует
+/// рестарта демона — это зафиксировано в брифе и в поле `error` ответа.
+///
+/// Изменённой считается запись `[[paths]]`, у которой поменялось хоть одно
+/// влияющее на воркера поле (`index_dir`, `debounce_ms`, `batch_ms`, `language`,
+/// `max_code_file_size_bytes`, `bulk_batch_threshold`). Раньше `reload` сравнивал
+/// только пути и смену `index_dir` относил к `unchanged` — воркер продолжал
+/// писать в старый каталог.
+#[allow(clippy::too_many_arguments)]
 async fn handle_reload(
     state: &DaemonState,
-    workers: &mut HashMap<PathBuf, tokio::task::JoinHandle<()>>,
+    workers: &mut HashMap<PathBuf, WorkerSlot>,
     worker_entries: &mut HashMap<PathBuf, PathEntry>,
+    respawn_tracker: &mut HashMap<PathBuf, (u32, std::time::Instant)>,
+    rare_retries: &mut HashMap<PathBuf, std::time::Instant>,
+    rare_reported: &mut std::collections::HashSet<PathBuf>,
     shutdown_tx: &broadcast::Sender<()>,
-    processor_registry: Option<Arc<ProcessorRegistry>>,
+    processor_registry: &Option<Arc<ProcessorRegistry>>,
 ) -> ReloadResponse {
     let cfg = match config::load_or_default() {
         Ok(c) => c,
@@ -619,21 +647,20 @@ async fn handle_reload(
                 reloaded: false,
                 added: vec![],
                 removed: vec![],
+                changed: vec![],
                 unchanged: vec![],
                 error: Some(format!("Не удалось перечитать конфиг: {}", e)),
             };
         }
     };
 
-    let wanted_canon: Vec<PathBuf> = cfg
-        .paths
-        .iter()
-        .map(|p| p.path.canonicalize().unwrap_or_else(|_| p.path.clone()))
-        .collect();
-    let (added, removed, unchanged) = state.apply_config(&wanted_canon).await;
+    let outcome = state.apply_config(&cfg.paths).await;
+    let (added, removed, changed, unchanged) =
+        (outcome.added, outcome.removed, outcome.changed, outcome.unchanged);
 
-    // Запускаем worker'ы для добавленных. Семафор берём из текущего конфига —
-    // предположение: limiter не меняется в рантайме, только при рестарте демона.
+    // Запускаем worker'ы для добавленных и перезапускаем изменённые. Семафор
+    // берём из текущего конфига — предположение: limiter не меняется в
+    // рантайме, только при рестарте демона.
     let limiter = if cfg.daemon.max_concurrent_initial == 0 {
         None
     } else {
@@ -655,23 +682,44 @@ async fn handle_reload(
     };
 
     for entry in cfg.paths.into_iter() {
-        let canonical = entry
-            .path
-            .canonicalize()
-            .unwrap_or_else(|_| entry.path.clone());
-        if added.contains(&canonical) {
-            worker_entries.insert(canonical.clone(), entry.clone());
-            let handle = spawn_worker(
-                entry,
-                state.clone(),
-                shutdown_tx.subscribe(),
-                limiter.clone(),
-                indexer_section.clone(),
-                processor_registry.clone(),
-                reload_cache_client.clone(),
-            );
-            workers.insert(canonical, handle);
+        let canonical = crate::paths::canonicalize(&entry.path);
+        let is_changed = changed.contains(&canonical);
+        if !added.contains(&canonical) && !is_changed {
+            continue;
         }
+
+        if is_changed {
+            // Останавливаем старый воркер кооперативно и поднимаем новый с
+            // обновлённой записью. Общий broadcast тут не годится — он погасил
+            // бы все папки, а не одну.
+            if let Some(old) = workers.remove(&canonical) {
+                old.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                // `abort()` блокирующий поток не останавливает; отпускаем handle
+                // — воркер выйдет сам на ближайшей проверке стоп-сигнала.
+                drop(old.handle);
+            }
+            // Бэкофф прошлых аварий не должен душить новый воркер с другой
+            // конфигурацией, а «об этом уже сообщено» — молчать о новых сбоях.
+            respawn_tracker.remove(&canonical);
+            rare_retries.remove(&canonical);
+            rare_reported.remove(&canonical);
+            tracing::info!(
+                "reload: путь {} изменился — воркер перезапускается с новым конфигом",
+                canonical.display()
+            );
+        }
+
+        worker_entries.insert(canonical.clone(), entry.clone());
+        let slot = spawn_worker(
+            entry,
+            state.clone(),
+            shutdown_tx.subscribe(),
+            limiter.clone(),
+            indexer_section.clone(),
+            processor_registry.clone(),
+            reload_cache_client.clone(),
+        );
+        workers.insert(canonical, slot);
     }
 
     let note = if removed.is_empty() {
@@ -686,6 +734,7 @@ async fn handle_reload(
         reloaded: true,
         added,
         removed,
+        changed,
         unchanged,
         error: note,
     }
@@ -741,11 +790,10 @@ fn migrate_languages(cfg_path: &std::path::Path, cfg: &mut config::DaemonFileCon
         }
         // Корень репо для эвристик. Канонизация может упасть на не существующем
         // пути — тогда работаем с тем что в конфиге; detect_language вернёт None
-        // и мы пропустим запись.
-        let root = entry
-            .path
-            .canonicalize()
-            .unwrap_or_else(|_| entry.path.clone());
+        // и мы пропустим запись. I/O-чтение (обход маркеров корня): verbatim-путь
+        // здесь читается, но приводим к обычной форме для единообразия — тем же
+        // хелпером, что и остальные ключеобразующие точки.
+        let root = crate::paths::canonicalize(&entry.path);
 
         match language_detect::detect_language(&root) {
             Some(lang) => match language_detect::write_language_back(cfg_path, &entry.path, lang) {
@@ -958,6 +1006,7 @@ mod migrate_tests {
     }
 
     #[test]
+    #[allow(clippy::disallowed_methods)] // канонизация в тесте — для сравнения с самим собой
     fn fills_language_for_entries_without_it() {
         let tmp = TempDir::new().unwrap();
 
@@ -1002,6 +1051,7 @@ mod migrate_tests {
     }
 
     #[test]
+    #[allow(clippy::disallowed_methods)] // канонизация в тесте — для сравнения с самим собой
     fn keeps_explicit_language_unchanged() {
         let tmp = TempDir::new().unwrap();
         let repo = make_repo_with_marker(&tmp, "repo", "Cargo.toml");
@@ -1028,6 +1078,7 @@ mod migrate_tests {
     }
 
     #[test]
+    #[allow(clippy::disallowed_methods)] // канонизация в тесте — для сравнения с самим собой
     fn warns_but_doesnt_fail_when_language_undetectable() {
         let tmp = TempDir::new().unwrap();
         // Пустая директория — детектор не сможет определить язык.

@@ -1,0 +1,9 @@
+# Канонизация пути идёт ТОЛЬКО через `code_index_core::paths::canonicalize`.
+#
+# На Windows `std::fs::canonicalize` возвращает путь в verbatim-форме `\\?\`, и
+# по такому пути ломается создание каталогов и сателлитов SQLite (`-wal`/`-shm`),
+# а сам `\\?\` утекает наружу в `/health`, `/path-status`, `get_stats`. Поэтому
+# голый `std::fs::canonicalize` вне хелпера запрещён (требование 1 ТЗ
+# docs/tz-inrepo-index-verbatim-paths.md). Тесты, где канонизация нужна лишь для
+# сравнения с самим собой, помечены `#[allow(clippy::disallowed_methods)]`.
+disallowed-methods = ["std::fs::canonicalize"]

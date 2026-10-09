@@ -322,9 +322,8 @@ enum DaemonAction {
 
 /// Получить путь к БД для проекта
 fn get_db_path(project_path: &str) -> anyhow::Result<PathBuf> {
-    let root = Path::new(project_path)
-        .canonicalize()
-        .unwrap_or_else(|_| PathBuf::from(project_path));
+    // I/O: от корня строится каталог индекса, путь уходит в SQLite.
+    let root = crate::paths::canonicalize(Path::new(project_path));
     crate::index_location::db_for_path(&root, None)
 }
 
@@ -387,9 +386,9 @@ fn build_repo_entries(
             ));
         }
 
-        let root = Path::new(&dir)
-            .canonicalize()
-            .unwrap_or_else(|_| PathBuf::from(&dir));
+        // I/O и наружу: результат становится `RepoEntry.root_path`, его видят
+        // `get_stats`/`health`, и от него строится `db_path`.
+        let root = crate::paths::canonicalize(Path::new(&dir));
         // Один негодный путь не должен отменять остальные: без базы репо
         // пометится недоступным (см. открытие ниже), а сервер поднимется.
         let db_path = match crate::index_location::db_for_path(&root, config_path) {
@@ -656,7 +655,9 @@ pub async fn run(registry: ProcessorRegistry) -> anyhow::Result<()> {
 
     match cli.command {
         Commands::IndexLocation { path } => {
-            let root = Path::new(&path).canonicalize().unwrap_or_else(|_| PathBuf::from(path));
+            // I/O + печать пути наружу: путь показывается оператору как есть,
+            // verbatim-префикс здесь был бы мусором.
+            let root = crate::paths::canonicalize(Path::new(&path));
             println!("{}", crate::index_location::directory_for_path(&root, None)?.display());
         }
         Commands::Serve { path, transport, host, port, config, serve_config } => {
@@ -1121,14 +1122,20 @@ fn cmd_index(
     tracing::info!("Индексация: path={}, force={}", path, force);
 
     // 1. Разрешить путь до абсолютного
-    let abs_path = Path::new(&path)
-        .canonicalize()
-        .unwrap_or_else(|_| PathBuf::from(&path));
+    // I/O: дальше `create_dir_all` каталога индекса и открытие SQLite — на
+    // verbatim-пути это и ломалось (mkdir — os error 5, база — readonly/cantopen).
+    let abs_path = crate::paths::canonicalize(Path::new(&path));
 
     // 2. Создать выбранный каталог индекса.
     let db_dir = crate::index_location::directory_for_path(&abs_path, None)?;
-    std::fs::create_dir_all(&db_dir)
-        .map_err(|e| anyhow::anyhow!("Не удалось создать директорию {:?}: {}", db_dir, e))?;
+    std::fs::create_dir_all(&db_dir).map_err(|e| {
+        anyhow::anyhow!(
+            "Не удалось создать директорию {:?}: {}{}",
+            db_dir,
+            e,
+            crate::paths::verbatim_hint(&db_dir)
+        )
+    })?;
 
     // 3. Загрузить конфигурацию проекта
     let db_path = db_dir.join("index.db");
@@ -1458,9 +1465,9 @@ fn cmd_clean(path: String) -> anyhow::Result<()> {
     let storage = Storage::open_file(&db_path)?;
 
     // 2. Разрешить корневой путь проекта
-    let project_root = std::path::Path::new(&path)
-        .canonicalize()
-        .unwrap_or_else(|_| std::path::PathBuf::from(&path));
+    // I/O: к корню дописываются относительные пути из индекса и по ним идёт
+    // `symlink_metadata` — verbatim-форма тут ни к чему.
+    let project_root = crate::paths::canonicalize(std::path::Path::new(&path));
 
     // 3. Получить все файлы из индекса
     let files = storage.get_all_files()?;
@@ -1522,9 +1529,8 @@ fn cmd_clean(path: String) -> anyhow::Result<()> {
 /// Ветка `init`: создать конфигурацию по умолчанию.
 fn cmd_init(path: String) -> anyhow::Result<()> {
     // 1. Разрешить путь до абсолютного
-    let abs_path = Path::new(&path)
-        .canonicalize()
-        .unwrap_or_else(|_| PathBuf::from(&path));
+    // I/O: конфигурация проекта создаётся в каталоге индекса.
+    let abs_path = crate::paths::canonicalize(Path::new(&path));
 
     let index_dir = crate::index_location::directory_for_path(&abs_path, None)?;
     let config_path = index_dir.join("config.json");

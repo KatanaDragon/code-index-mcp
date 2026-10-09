@@ -10,6 +10,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::RwLock;
 
+use super::config::PathEntry;
 use super::ipc::{PathHealth, PathStatus, Progress};
 
 /// Разделяемое состояние, которое демон держит в памяти.
@@ -25,6 +26,52 @@ struct DaemonStateInner {
     started_at_rfc3339: String,
     /// Статусы папок.
     paths: HashMap<PathBuf, PathRuntime>,
+    /// Значимые поля записи `[[paths]]`, применённые в прошлый раз. По ним
+    /// `reload` отличает изменённый путь от неизменного: раньше сравнивались
+    /// только пути, и смена `index_dir` молча попадала в `unchanged`.
+    entries: HashMap<PathBuf, EntrySig>,
+}
+
+/// Значимые для воркера поля `PathEntry` — без `path` и `alias`.
+///
+/// `path` — это ключ мапы (уже приведён к одной форме упрощённой канонизацией),
+/// поэтому сравнивать исходные написания пути нельзя: один и тот же каталог,
+/// записанный с хвостовым слешем или другим регистром, дал бы ложное «изменение».
+/// `alias` демон игнорирует (его читает только `serve`), и он не должен
+/// блокировать reload.
+#[derive(Debug, Clone, PartialEq)]
+struct EntrySig {
+    index_dir: Option<PathBuf>,
+    debounce_ms: Option<u64>,
+    batch_ms: Option<u64>,
+    language: Option<String>,
+    max_code_file_size_bytes: Option<usize>,
+    bulk_batch_threshold: Option<usize>,
+}
+
+impl EntrySig {
+    fn of(entry: &PathEntry) -> Self {
+        Self {
+            index_dir: entry.index_dir.clone(),
+            debounce_ms: entry.debounce_ms,
+            batch_ms: entry.batch_ms,
+            language: entry.language.clone(),
+            max_code_file_size_bytes: entry.max_code_file_size_bytes,
+            bulk_batch_threshold: entry.bulk_batch_threshold,
+        }
+    }
+}
+
+/// Итог применения конфига к состоянию. `changed` — путь был и остался, но
+/// значимые поля записи поменялись: воркер надо перезапустить с новой записью.
+/// `exclude_dirs` сюда не входит намеренно: это поле проекта
+/// (`.code-index/config.json`), а не `daemon.toml`, и reload его не видит.
+#[derive(Debug, Clone, Default)]
+pub struct ApplyOutcome {
+    pub added: Vec<PathBuf>,
+    pub removed: Vec<PathBuf>,
+    pub changed: Vec<PathBuf>,
+    pub unchanged: Vec<PathBuf>,
 }
 
 /// Runtime-данные по одной папке.
@@ -81,6 +128,7 @@ impl DaemonState {
                 started_at_unix,
                 started_at_rfc3339,
                 paths: HashMap::new(),
+                entries: HashMap::new(),
             })),
         }
     }
@@ -91,32 +139,53 @@ impl DaemonState {
         guard.paths.keys().cloned().collect()
     }
 
-    /// Зарегистрировать набор путей в состоянии. Новые пути добавляются
-    /// со статусом `NotStarted`; убранные — удаляются; существующие не трогаются.
-    /// Возвращает `(added, removed, unchanged)`.
-    pub async fn apply_config(&self, paths: &[PathBuf]) -> (Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>) {
+    /// Применить к состоянию набор записей `[[paths]]`. Новые пути добавляются
+    /// со статусом `NotStarted`; убранные — удаляются; у существующих сравнение
+    /// значимых полей записи отделяет изменённые (`changed`) от неизменных
+    /// (`unchanged`). Ключи — упрощённая канонизация (без verbatim-префикса),
+    /// та же, что строит воркер для своего пути.
+    pub async fn apply_config(&self, entries: &[PathEntry]) -> ApplyOutcome {
         let mut guard = self.inner.write().await;
-        let mut added = Vec::new();
-        let mut unchanged = Vec::new();
+        let mut out = ApplyOutcome::default();
 
-        let wanted: std::collections::HashSet<_> = paths.iter().cloned().collect();
-        let existing: std::collections::HashSet<_> = guard.paths.keys().cloned().collect();
-
-        for p in &wanted {
-            if !existing.contains(p) {
-                guard.paths.insert(p.clone(), PathRuntime::default());
-                added.push(p.clone());
-            } else {
-                unchanged.push(p.clone());
+        // Порядок конфига сохраняем в списке ключей: результат reload виден
+        // оператору, и «прыгающие» строки читались бы хуже.
+        let mut keys: Vec<PathBuf> = Vec::with_capacity(entries.len());
+        let mut wanted: HashMap<PathBuf, EntrySig> = HashMap::with_capacity(entries.len());
+        for entry in entries {
+            let key = crate::paths::canonicalize(&entry.path);
+            if wanted.insert(key.clone(), EntrySig::of(entry)).is_none() {
+                keys.push(key);
             }
         }
 
-        let removed: Vec<PathBuf> = existing.difference(&wanted).cloned().collect();
+        for key in &keys {
+            match guard.entries.get(key) {
+                None => {
+                    guard.paths.insert(key.clone(), PathRuntime::default());
+                    out.added.push(key.clone());
+                }
+                Some(prev) if prev != &wanted[key] => out.changed.push(key.clone()),
+                Some(_) => out.unchanged.push(key.clone()),
+            }
+        }
+
+        let mut removed: Vec<PathBuf> = guard
+            .paths
+            .keys()
+            .filter(|p| !wanted.contains_key(*p))
+            .cloned()
+            .collect();
+        removed.sort();
         for p in &removed {
             guard.paths.remove(p);
         }
+        out.removed = removed;
 
-        (added, removed, unchanged)
+        // Снимок применённой конфигурации — база для сравнения на следующем reload.
+        guard.entries = wanted;
+
+        out
     }
 
     /// Запомнить поток, который ведёт эту папку. Вызывается самим рабочим
@@ -230,30 +299,86 @@ impl Default for DaemonState {
 mod tests {
     use super::*;
 
+    /// Минимальная запись `[[paths]]` для тестов состояния.
+    fn entry(path: &str) -> PathEntry {
+        PathEntry {
+            path: PathBuf::from(path),
+            index_dir: None,
+            debounce_ms: None,
+            batch_ms: None,
+            alias: None,
+            language: None,
+            max_code_file_size_bytes: None,
+            bulk_batch_threshold: None,
+        }
+    }
+
     #[tokio::test]
     async fn apply_config_tracks_diff() {
         let st = DaemonState::new();
 
-        let (added, removed, unchanged) = st
-            .apply_config(&[PathBuf::from("/a"), PathBuf::from("/b")])
+        let out = st
+            .apply_config(&[entry("/a"), entry("/b")])
             .await;
-        assert_eq!(added.len(), 2);
-        assert_eq!(removed.len(), 0);
-        assert_eq!(unchanged.len(), 0);
+        assert_eq!(out.added.len(), 2);
+        assert_eq!(out.removed.len(), 0);
+        assert_eq!(out.changed.len(), 0);
+        assert_eq!(out.unchanged.len(), 0);
 
-        let (added, removed, unchanged) = st
-            .apply_config(&[PathBuf::from("/b"), PathBuf::from("/c")])
+        let out = st
+            .apply_config(&[entry("/b"), entry("/c")])
             .await;
-        assert_eq!(added, vec![PathBuf::from("/c")]);
-        assert_eq!(removed, vec![PathBuf::from("/a")]);
-        assert_eq!(unchanged, vec![PathBuf::from("/b")]);
+        assert_eq!(out.added, vec![PathBuf::from("/c")]);
+        assert_eq!(out.removed, vec![PathBuf::from("/a")]);
+        assert_eq!(out.changed.len(), 0);
+        assert_eq!(out.unchanged, vec![PathBuf::from("/b")]);
+    }
+
+    /// Приёмка 7б: `reload` видит смену `index_dir` у существующего пути.
+    /// Раньше сравнивались только пути, и смена каталога индекса оставалась
+    /// в `unchanged` — воркер продолжал писать в старый.
+    #[tokio::test]
+    async fn apply_config_detects_index_dir_change() {
+        let st = DaemonState::new();
+        st.apply_config(&[entry("/repo")]).await;
+
+        let same = st.apply_config(&[entry("/repo")]).await;
+        assert!(same.changed.is_empty(), "без правок путь не менялся: {:?}", same.changed);
+        assert_eq!(same.unchanged, vec![PathBuf::from("/repo")]);
+
+        let mut moved = entry("/repo");
+        moved.index_dir = Some(PathBuf::from("/indexes/repo"));
+        let out = st.apply_config(&[moved.clone()]).await;
+
+        assert_eq!(out.changed, vec![PathBuf::from("/repo")]);
+        assert!(out.unchanged.is_empty());
+        assert!(out.added.is_empty());
+
+        // Повторное применение той же записи снова считает её неизменной —
+        // снимок обновился.
+        let again = st.apply_config(&[moved]).await;
+        assert!(again.changed.is_empty());
+        assert_eq!(again.unchanged, vec![PathBuf::from("/repo")]);
+    }
+
+    /// `alias` демон игнорирует — правка `alias` не должна перезапускать воркер.
+    #[tokio::test]
+    async fn apply_config_ignores_alias_change() {
+        let st = DaemonState::new();
+        st.apply_config(&[entry("/repo")]).await;
+
+        let mut renamed = entry("/repo");
+        renamed.alias = Some("widgets".into());
+        let out = st.apply_config(&[renamed]).await;
+        assert!(out.changed.is_empty(), "alias не влияет на воркер: {:?}", out.changed);
+        assert_eq!(out.unchanged, vec![PathBuf::from("/repo")]);
     }
 
     #[tokio::test]
     async fn set_ready_clears_progress() {
         let st = DaemonState::new();
         let path = PathBuf::from("/a");
-        st.apply_config(&[path.clone()]).await;
+        st.apply_config(&[entry("/a")]).await;
         st.set_status(&path, PathStatus::InitialIndexing).await;
         st.set_progress(&path, Progress::new(10, 100)).await;
 
