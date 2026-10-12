@@ -9,7 +9,10 @@
 //   * `defined_type_content`       — типы определяемого типа
 //     (DefinedTypes/<X>.xml, `<Type><v8:Type>` через `classify_type`);
 //   * `functional_option_location` — где хранится значение ФО
-//     (FunctionalOptions/<X>.xml, `<Location>`).
+//     (FunctionalOptions/<X>.xml, `<Location>`);
+//   * `common_attribute_content`   — состав общего реквизита
+//     (CommonAttributes/<X>.xml, `<Content><xr:Item>` с `<xr:Use>Use`, плюс
+//     признак `<AutoUse>Use` — реквизит у всех объектов).
 //
 // Права ролей (`Roles/<X>/Ext/Rights.xml`) выносятся в ОТДЕЛЬНУЮ таблицу
 // `role_rights` (право — атрибут пары роль↔объект, а не ребро объект↔объект,
@@ -128,6 +131,106 @@ pub fn parse_exchange_plan_content_xml(content: &str) -> Result<Vec<String>> {
             Err(e) => {
                 return Err(anyhow::anyhow!(
                     "exchange plan content XML: ошибка парсинга на позиции {}: {}",
+                    reader.buffer_position(),
+                    e
+                ))
+            }
+            _ => {}
+        }
+        buf.clear();
+    }
+    Ok(out)
+}
+
+// ── Общие реквизиты: <Content><xr:Item><xr:Metadata>/<xr:Use> ─────────────
+
+/// Цель ребра автоприменяемого общего реквизита (`<AutoUse>Use</AutoUse>`):
+/// служебный *-узел «все объекты», конкретного списка в выгрузке нет.
+pub const COMMON_ATTRIBUTE_AUTO_TARGET: &str = "*All";
+/// `from_path` ребра на `*All` — отличает автоприменение от явного состава.
+pub const COMMON_ATTRIBUTE_AUTO_PATH: &str = "auto";
+
+/// Состав общего реквизита (`CommonAttributes/<X>.xml`).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct CommonAttributeContent {
+    /// Объекты с `<xr:Use>Use</xr:Use>`. `DontUse` — не состав (при
+    /// автоприменении это исключения), `Auto` следует `AutoUse` и покрыт
+    /// ребром на `*All`; `<xr:ConditionalSeparation>` не нужен.
+    pub items: Vec<String>,
+    /// `<AutoUse>Use</AutoUse>` — реквизит у всех объектов, кроме `DontUse`.
+    pub auto_use: bool,
+}
+
+/// Распарсить XML общего реквизита → явный состав и признак автоприменения.
+/// Элемент состава собирается целиком (`<xr:Metadata>` + `<xr:Use>`) и
+/// попадает в результат на закрытии `<xr:Item>`.
+pub fn parse_common_attribute_content_xml(content: &str) -> Result<CommonAttributeContent> {
+    #[derive(Clone, Copy, PartialEq)]
+    enum Want {
+        None,
+        Metadata,
+        Use,
+        AutoUse,
+    }
+
+    let mut reader = Reader::from_str(content);
+    reader.config_mut().trim_text(true);
+    let mut buf = Vec::new();
+    let mut out = CommonAttributeContent::default();
+    // `Content` с заглавной — состав; `<v8:content>` синонима сюда не попадает.
+    let mut in_content = false;
+    let mut want = Want::None;
+    let mut cur_meta: Option<String> = None;
+    let mut cur_use: Option<String> = None;
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => {
+                let local = local_name(&String::from_utf8_lossy(e.name().as_ref()));
+                match local.as_str() {
+                    "Content" => in_content = true,
+                    "Item" if in_content => {
+                        cur_meta = None;
+                        cur_use = None;
+                    }
+                    "Metadata" if in_content => want = Want::Metadata,
+                    "Use" if in_content => want = Want::Use,
+                    "AutoUse" if !in_content => want = Want::AutoUse,
+                    _ => {}
+                }
+            }
+            Ok(Event::Text(t)) => {
+                if want != Want::None {
+                    let txt = t.unescape().map(|s| s.into_owned()).unwrap_or_default();
+                    let txt = txt.trim().to_string();
+                    match want {
+                        Want::Metadata => cur_meta = Some(txt),
+                        Want::Use => cur_use = Some(txt),
+                        Want::AutoUse => out.auto_use = txt == "Use",
+                        Want::None => {}
+                    }
+                    want = Want::None;
+                }
+            }
+            Ok(Event::End(e)) => {
+                match local_name(&String::from_utf8_lossy(e.name().as_ref())).as_str() {
+                    "Content" => in_content = false,
+                    "Item" if in_content => {
+                        if let (Some(meta), Some("Use")) = (cur_meta.take(), cur_use.as_deref()) {
+                            if !meta.is_empty() {
+                                out.items.push(meta);
+                            }
+                        }
+                        cur_use = None;
+                    }
+                    _ => {}
+                }
+                want = Want::None;
+            }
+            Ok(Event::Eof) => break,
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "common attribute XML: ошибка парсинга на позиции {}: {}",
                     reader.buffer_position(),
                     e
                 ))
@@ -393,6 +496,13 @@ pub fn parse_exchange_plan_content_file(path: &Path) -> Result<Vec<String>> {
     }
 }
 
+pub fn parse_common_attribute_content_file(path: &Path) -> Result<CommonAttributeContent> {
+    match read_to_string_opt(path)? {
+        Some(c) => parse_common_attribute_content_xml(&c),
+        None => Ok(CommonAttributeContent::default()),
+    }
+}
+
 pub fn parse_defined_type_targets_file(path: &Path) -> Result<Vec<(String, bool)>> {
     match read_to_string_opt(path)? {
         Some(c) => parse_defined_type_targets_xml(&c),
@@ -553,6 +663,71 @@ mod tests {
                 "Catalog.ВариантыОтчетов".to_string(),
                 "Catalog.Партнеры".to_string()
             ]
+        );
+    }
+
+    #[test]
+    fn common_attribute_content_takes_only_use() {
+        // Формат выгрузки MDM: <Content> в <Properties>, элемент — Metadata +
+        // Use + ConditionalSeparation; синоним с <v8:content> составом не считается.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" xmlns:v8="http://v8.1c.ru/8.1/data/core" xmlns:xr="http://v8.1c.ru/8.3/xcf/readable">
+  <CommonAttribute uuid="c1">
+    <Properties>
+      <Name>MDM_Key</Name>
+      <Synonym><v8:item><v8:lang>ru</v8:lang><v8:content>MDM key</v8:content></v8:item></Synonym>
+      <Content>
+        <xr:Item>
+          <xr:Metadata>Catalog.КРБ_ВидыСудов</xr:Metadata>
+          <xr:Use>Use</xr:Use>
+          <xr:ConditionalSeparation/>
+        </xr:Item>
+        <xr:Item>
+          <xr:Metadata>Catalog.Номенклатура</xr:Metadata>
+          <xr:Use>DontUse</xr:Use>
+          <xr:ConditionalSeparation/>
+        </xr:Item>
+        <xr:Item>
+          <xr:Metadata>Document.Заявка</xr:Metadata>
+          <xr:Use>Use</xr:Use>
+          <xr:ConditionalSeparation/>
+        </xr:Item>
+      </Content>
+      <AutoUse>DontUse</AutoUse>
+      <DataSeparation>DontUse</DataSeparation>
+    </Properties>
+  </CommonAttribute>
+</MetaDataObject>"#;
+        let ca = parse_common_attribute_content_xml(xml).unwrap();
+        assert_eq!(
+            ca.items,
+            vec![
+                "Catalog.КРБ_ВидыСудов".to_string(),
+                "Document.Заявка".to_string()
+            ]
+        );
+        assert!(!ca.auto_use);
+    }
+
+    #[test]
+    fn common_attribute_auto_use_flag() {
+        // AutoUse=Use: элементы DontUse — исключения, явного состава нет.
+        let xml = r#"<MetaDataObject xmlns:xr="x"><CommonAttribute><Properties>
+  <Name>ОбластьДанных</Name>
+  <Content>
+    <xr:Item><xr:Metadata>Catalog.Пользователи</xr:Metadata><xr:Use>DontUse</xr:Use></xr:Item>
+  </Content>
+  <AutoUse>Use</AutoUse>
+</Properties></CommonAttribute></MetaDataObject>"#;
+        let ca = parse_common_attribute_content_xml(xml).unwrap();
+        assert!(ca.items.is_empty());
+        assert!(ca.auto_use);
+        // Пустой состав без AutoUse — пустой результат.
+        let empty = r#"<MetaDataObject><CommonAttribute><Properties><Name>X</Name>
+  <Content/><AutoUse>DontUse</AutoUse></Properties></CommonAttribute></MetaDataObject>"#;
+        assert_eq!(
+            parse_common_attribute_content_xml(empty).unwrap(),
+            CommonAttributeContent::default()
         );
     }
 

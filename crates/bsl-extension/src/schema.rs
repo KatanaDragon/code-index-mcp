@@ -484,6 +484,10 @@ pub const SCHEMA_EXTENSIONS: &[&str] = &[
     //   * `functional_option_location` — ФО → объект хранения значения
     //     (константа/ресурс регистра). `from_object` = `FunctionalOption.<Имя>`,
     //     `from_path` — полный путь хранения из `<Location>`.
+    //   * `common_attribute_content`   — общий реквизит → объект его состава
+    //     (`<Content>`, только `Use = Use`). `from_object` = `CommonAttribute.<Имя>`.
+    //     Автоприменяемый (`AutoUse = Use`) — плюс ребро на *-узел `*All`
+    //     с `from_path = 'auto'` (`is_universal = 1`).
     //
     // `is_composite` — ребро из составного типа (перечислено несколько
     // конкретных типов). `is_universal` — обобщённый тип, схлопнут в

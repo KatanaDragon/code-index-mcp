@@ -28,6 +28,7 @@ use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
 use super::forms::FormHandler;
+use super::metadata_refs::{COMMON_ATTRIBUTE_AUTO_PATH, COMMON_ATTRIBUTE_AUTO_TARGET};
 
 use super::object_attributes::{
     classify_type, pretty_types, DataLinkEdge, ObjectStructure, StructField, StructTabular,
@@ -992,11 +993,13 @@ pub fn detect_edt_src(repo_root: &Path) -> Option<PathBuf> {
 }
 
 /// Конфигурационные рёбра из `.mdo`: состав подсистемы и плана обмена, цели
-/// определяемого типа, расположение и состав функциональной опции.
+/// определяемого типа, расположение и состав функциональной опции, состав
+/// общего реквизита.
 ///
 /// В формате Конфигуратора каждый вид лежит в своём файле (`Subsystems/**.xml`,
 /// `ExchangePlans/<X>/Ext/Content.xml`, `DefinedTypes/<X>.xml`,
-/// `FunctionalOptions/<X>.xml`), и их читает `index_metadata_refs`. В EDT всё
+/// `FunctionalOptions/<X>.xml`, `CommonAttributes/<X>.xml`), и их читает
+/// `index_metadata_refs`. В EDT всё
 /// это — теги внутри самого `.mdo` объекта, поэтому разбор идёт тем же проходом,
 /// что и остальная шапка: повторное чтение файла не нужно.
 ///
@@ -1015,13 +1018,16 @@ pub fn parse_mdo_config_refs(
         DefinedType,
         FoLocation,
         FoContent,
+        CaMetadata,
+        CaUse,
+        CaAutoUse,
     }
 
     // Виды, у которых конфигурационных рёбер не бывает, отсекаем сразу:
     // проход по XML ради заведомо пустого результата не нужен.
     if !matches!(
         meta_type,
-        "Subsystem" | "ExchangePlan" | "DefinedType" | "FunctionalOption"
+        "Subsystem" | "ExchangePlan" | "DefinedType" | "FunctionalOption" | "CommonAttribute"
     ) {
         return Vec::new();
     }
@@ -1035,6 +1041,11 @@ pub fn parse_mdo_config_refs(
     let mut in_content = false; // <content> плана обмена (обёртка над <mdObject>)
     let mut in_type = false; // <type> определяемого типа (обёртка над <types>)
     let mut raw_types: Vec<String> = Vec::new();
+    // Элемент состава общего реквизита: `<content><metadata>…</metadata>
+    // <use>Use</use></content>`. Без `<use>` значение по умолчанию — Auto
+    // (следует autoUse), ребром на объект не становится, как и в Конфигураторе.
+    let mut ca_meta: Option<String> = None;
+    let mut ca_use: Option<String> = None;
     let mut out: Vec<(&'static str, String, String, bool, bool)> = Vec::new();
 
     loop {
@@ -1051,6 +1062,14 @@ pub fn parse_mdo_config_refs(
                     ("DefinedType", 3, "types") if in_type => want = Want::DefinedType,
                     ("FunctionalOption", 2, "location") => want = Want::FoLocation,
                     ("FunctionalOption", 2, "content") => want = Want::FoContent,
+                    ("CommonAttribute", 2, "content") => {
+                        in_content = true;
+                        ca_meta = None;
+                        ca_use = None;
+                    }
+                    ("CommonAttribute", 3, "metadata") if in_content => want = Want::CaMetadata,
+                    ("CommonAttribute", 3, "use") if in_content => want = Want::CaUse,
+                    ("CommonAttribute", 2, "autoUse") => want = Want::CaAutoUse,
                     _ => {}
                 }
             }
@@ -1095,6 +1114,19 @@ pub fn parse_mdo_config_refs(
                                 }
                             }
                             Want::DefinedType => raw_types.push(txt),
+                            Want::CaMetadata => ca_meta = Some(txt),
+                            Want::CaUse => ca_use = Some(txt),
+                            Want::CaAutoUse => {
+                                if txt == "Use" {
+                                    out.push((
+                                        "common_attribute_content",
+                                        COMMON_ATTRIBUTE_AUTO_TARGET.to_string(),
+                                        COMMON_ATTRIBUTE_AUTO_PATH.to_string(),
+                                        false,
+                                        true,
+                                    ));
+                                }
+                            }
                             Want::None => {}
                         }
                     }
@@ -1104,7 +1136,13 @@ pub fn parse_mdo_config_refs(
             Ok(Event::End(e)) => {
                 let raw = String::from_utf8_lossy(e.name().as_ref()).into_owned();
                 match local_name(&raw) {
-                    "content" => in_content = false,
+                    "content" => {
+                        in_content = false;
+                        if let (Some(meta), Some("Use")) = (ca_meta.take(), ca_use.as_deref()) {
+                            out.push(("common_attribute_content", meta, String::new(), false, false));
+                        }
+                        ca_use = None;
+                    }
                     "type" => in_type = false,
                     _ => {}
                 }
@@ -1630,5 +1668,66 @@ mod tests {
 
         // Вид без конфигурационных рёбер — пустой результат без разбора.
         assert!(parse_mdo_config_refs("Catalog", sub).is_empty());
+    }
+
+    #[test]
+    fn config_refs_common_attribute_content() {
+        // Состав общего реквизита: <content> — обёртка над <metadata>/<use>;
+        // ребро только при use=Use, DontUse и умолчание (Auto) — нет.
+        let ca = r#"<?xml version="1.0" encoding="UTF-8"?>
+<mdclass:CommonAttribute xmlns:mdclass="http://g5.1c.ru/v8/dt/metadata/mdclass" uuid="c">
+  <name>MDM_Key</name>
+  <synonym><key>ru</key><value>MDM key</value></synonym>
+  <content>
+    <metadata>Catalog.КРБ_ВидыСудов</metadata>
+    <use>Use</use>
+  </content>
+  <content>
+    <metadata>Catalog.Номенклатура</metadata>
+    <use>DontUse</use>
+  </content>
+  <content>
+    <metadata>Document.Заявка</metadata>
+    <use>Use</use>
+  </content>
+  <content>
+    <metadata>Catalog.Валюты</metadata>
+  </content>
+</mdclass:CommonAttribute>"#;
+        assert_eq!(
+            parse_mdo_config_refs("CommonAttribute", ca)
+                .iter()
+                .map(|r| (r.0, r.1.clone(), r.2.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    "common_attribute_content",
+                    "Catalog.КРБ_ВидыСудов".to_string(),
+                    String::new()
+                ),
+                ("common_attribute_content", "Document.Заявка".to_string(), String::new()),
+            ]
+        );
+
+        // Автоприменение: ребро на *All с from_path='auto' и is_universal.
+        let auto = r#"<?xml version="1.0" encoding="UTF-8"?>
+<mdclass:CommonAttribute xmlns:mdclass="http://g5.1c.ru/v8/dt/metadata/mdclass" uuid="a">
+  <name>ОбластьДанных</name>
+  <content>
+    <metadata>Catalog.Пользователи</metadata>
+    <use>DontUse</use>
+  </content>
+  <autoUse>Use</autoUse>
+</mdclass:CommonAttribute>"#;
+        assert_eq!(
+            parse_mdo_config_refs("CommonAttribute", auto),
+            vec![(
+                "common_attribute_content",
+                "*All".to_string(),
+                "auto".to_string(),
+                false,
+                true
+            )]
+        );
     }
 }

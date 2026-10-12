@@ -86,9 +86,12 @@ impl IndexTool for BslSqlTool {
          link_kind в data_links: объектные attr/tabular_attr/register_dim/recorder/owner \
          (owner: подчинённый справочник → владелец); \
          конфиг-уровень subsystem_content/exchange_plan_content/defined_type_content/\
-         functional_option_location/functional_option_content (from_object соответственно \
-         Subsystem.X/ExchangePlan.X/DefinedType.X/FunctionalOption.X; *_content у ФО — \
-         состав опции). В attributes_json у реквизитов есть synonym/required (когда заданы), \
+         functional_option_location/functional_option_content/common_attribute_content \
+         (from_object соответственно Subsystem.X/ExchangePlan.X/DefinedType.X/\
+         FunctionalOption.X/CommonAttribute.X; *_content у ФО — состав опции; \
+         common_attribute_content — объекты с Use в составе общего реквизита, \
+         автоприменяемый реквизит (AutoUse) — ребро to_object='*All', from_path='auto'). \
+         В attributes_json у реквизитов есть synonym/required (когда заданы), \
          у объектов — секции owners/value_types/properties/enum_synonyms/commands \
          (commands — команды объекта: [{name, synonym?}]). Core-таблицы \
          (без колонки repo): files(path, language, lines_total, mtime, file_size), \

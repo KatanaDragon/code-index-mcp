@@ -14,6 +14,8 @@ use crate::xml::dcs::{is_dcs_template, parse_dcs_queries};
 use crate::xml::forms::{parse_form_file, parse_form_refs_file, FormRefs};
 use crate::code_usages::{extract_code_usages, extract_query_usages};
 use crate::xml::metadata_refs::{
+    parse_common_attribute_content_file, COMMON_ATTRIBUTE_AUTO_PATH,
+    COMMON_ATTRIBUTE_AUTO_TARGET,
     parse_defined_type_targets_file, parse_exchange_plan_content_file,
     parse_functional_option_content_file, parse_functional_option_location_file,
     parse_role_rights_file, parse_subsystem_content_file,
@@ -333,11 +335,20 @@ pub(crate) fn index_data_links(repo_root: &Path, conn: &rusqlite::Connection) ->
 }
 
 
+/// `link_kind` рёбер конфигурационного уровня — SQL-список для `IN`. Их ведёт
+/// только `index_metadata_refs`; пофайловая пересборка объекта
+/// (`update_data_links_for_object`) их не трогает: у плана обмена и общего
+/// реквизита `from_object` совпадает с объектом, а источник рёбер — другой файл.
+pub(crate) const CONFIG_LINK_KINDS_SQL: &str = "('subsystem_content','exchange_plan_content',\
+     'defined_type_content','functional_option_location','functional_option_content',\
+     'common_attribute_content')";
+
 /// Заполнить рёбра `data_links` КОНФИГУРАЦИОННОГО уровня (этап 3.1):
 /// `subsystem_content`, `exchange_plan_content`, `defined_type_content`,
-/// `functional_option_location`. Источники — отдельные XML, которые
+/// `functional_option_location`, `functional_option_content`,
+/// `common_attribute_content`. Источники — отдельные XML, которые
 /// `index_data_links` не читает (Subsystems/**, ExchangePlans/<X>/Ext/Content.xml,
-/// DefinedTypes/<X>.xml, FunctionalOptions/<X>.xml).
+/// DefinedTypes/<X>.xml, FunctionalOptions/<X>.xml, CommonAttributes/<X>.xml).
 ///
 /// ВАЖНО: вызывать ПОСЛЕ `index_data_links` — она wipe-ит все рёбра repo и
 /// пишет объектные. Эта функция сносит только СВОИ `link_kind` (идемпотентность
@@ -351,9 +362,10 @@ pub(crate) fn index_metadata_refs(repo_root: &Path, conn: &rusqlite::Connection)
     let _ = conn.execute("ROLLBACK", []);
     conn.execute("BEGIN", [])?;
     conn.execute(
-        "DELETE FROM data_links WHERE repo = ?1 AND link_kind IN \
-         ('subsystem_content','exchange_plan_content','defined_type_content',\
-          'functional_option_location','functional_option_content')",
+        &format!(
+            "DELETE FROM data_links WHERE repo = ?1 AND link_kind IN {}",
+            CONFIG_LINK_KINDS_SQL
+        ),
         params![REPO_DEFAULT],
     )?;
     let mut stmt = conn.prepare(
@@ -563,6 +575,60 @@ pub(crate) fn index_metadata_refs(repo_root: &Path, conn: &rusqlite::Connection)
                         }
                         Err(e) => {
                             tracing::warn!("functional_option_content {}: {}", path.display(), e)
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── Общие реквизиты: CommonAttributes/<Имя>.xml (<Content>, <AutoUse>) ──
+        // Ребро — только на элементы с Use=Use. Автоприменяемый реквизит
+        // (AutoUse=Use) — дополнительно одно ребро на *-узел `*All` с
+        // from_path='auto': иначе «в каком общем реквизите объект» теряет их.
+        let ca_dir = root.join("CommonAttributes");
+        if ca_dir.is_dir() {
+            if let Ok(read) = std::fs::read_dir(&ca_dir) {
+                for entry in read.filter_map(|e| e.ok()) {
+                    let path = entry.path();
+                    if !path.is_file()
+                        || path.extension().and_then(|e| e.to_str()) != Some("xml")
+                    {
+                        continue;
+                    }
+                    let stem = match path.file_stem().and_then(|s| s.to_str()) {
+                        Some(s) => s,
+                        None => continue,
+                    };
+                    let from_object = format!("CommonAttribute.{}", stem);
+                    match parse_common_attribute_content_file(&path) {
+                        Ok(ca) => {
+                            for to_object in ca.items {
+                                stmt.execute(params![
+                                    REPO_DEFAULT,
+                                    &from_object,
+                                    "",
+                                    &to_object,
+                                    "common_attribute_content",
+                                    0_i64,
+                                    0_i64
+                                ])?;
+                                total += 1;
+                            }
+                            if ca.auto_use {
+                                stmt.execute(params![
+                                    REPO_DEFAULT,
+                                    &from_object,
+                                    COMMON_ATTRIBUTE_AUTO_PATH,
+                                    COMMON_ATTRIBUTE_AUTO_TARGET,
+                                    "common_attribute_content",
+                                    0_i64,
+                                    1_i64
+                                ])?;
+                                total += 1;
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("common_attribute_content {}: {}", path.display(), e)
                         }
                     }
                 }

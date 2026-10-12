@@ -43,8 +43,15 @@ pub(crate) fn update_data_links_for_object(
     };
     let _ = conn.execute("ROLLBACK", []);
     conn.execute("BEGIN", [])?;
+    // Рёбра конфигурационного уровня с тем же from_object (состав плана обмена,
+    // общего реквизита, определяемого типа) родятся из других файлов и ведутся
+    // `index_metadata_refs` — правка одного объектного XML их не сносит.
     conn.execute(
-        "DELETE FROM data_links WHERE repo = ? AND from_object = ?",
+        &format!(
+            "DELETE FROM data_links WHERE repo = ? AND from_object = ? \
+             AND link_kind NOT IN {}",
+            CONFIG_LINK_KINDS_SQL
+        ),
         params![REPO_DEFAULT, &owner_full],
     )?;
     {
@@ -489,6 +496,7 @@ pub fn run_incremental_extras(
             || (fname == "Content.xml" && has_comp("ExchangePlans"))
             || has_comp("DefinedTypes")
             || has_comp("FunctionalOptions")
+            || has_comp("CommonAttributes")
         {
             refs_dirty = true;
         }

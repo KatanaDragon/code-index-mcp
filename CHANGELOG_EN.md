@@ -7,6 +7,30 @@ Versioning — [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+**Common attribute composition is now in `data_links`: the new `common_attribute_content` edge kind answers "which common attributes include this object", and editing an exchange plan's object XML no longer wipes its composition in the incremental path.**
+
+> Context. MDM task 017 added catalogs to the composition of common attributes (`MDM_Key`, `нсиРучноеИзменение`, `нсиЗаявка`), and the index could not answer that question: there was no suitable `link_kind`, and `CommonAttributes/*.xml` were not parsed. Specification — `docs/tz-common-attribute-content.md`, item 1.
+
+### Added
+
+- **`common_attribute_content` edges.** Source — `CommonAttributes/<Name>.xml`, `<Properties><Content><xr:Item>`: `from_object = CommonAttribute.<Name>`, `to_object` — the object from `<xr:Metadata>`, empty `from_path`. Only items with `<xr:Use>Use</xr:Use>` are written: `DontUse` is not part of the composition (for an auto-used attribute these are exclusions), `<xr:ConditionalSeparation>` is not read. An auto-used attribute (`<AutoUse>Use</AutoUse>` — present on every object except `DontUse` ones) yields one edge to the service node `*All` with `from_path = 'auto'` and `is_universal = 1`, so a composition query does not lose such attributes. The EDT format (`.mdo`: `<content><metadata>…</metadata><use>Use</use></content>`, `<autoUse>`) is parsed in the same pass as the other configuration-level edges. The new kind is listed in the `bsl_sql` and `find_references` descriptions and in the `data_links` schema comment.
+- **Incremental path.** Editing, adding or removing `CommonAttributes/*.xml` marks configuration-level links for rebuild, same as subsystems, defined types and functional options; in EDT the edges are rebuilt together with the object's `.mdo`.
+
+### Fixed
+
+- **Per-object rebuild leaves configuration-level edges alone.** `update_data_links_for_object` deleted every edge with the object's `from_object`, including the exchange plan composition (`ExchangePlan.X` from `Ext/Content.xml`), while the configuration-level rebuild was triggered only by `Content.xml`. Editing just `ExchangePlans/<Name>.xml` (the plan's attributes) wiped its composition until the next full pass. Configuration-level kinds now live in one list (`CONFIG_LINK_KINDS_SQL`): `index_metadata_refs` cleans by it, and the per-object rebuild excludes it. The same list covers common attributes, whose `from_object` also matches an object from `OBJECT_FOLDERS`.
+
+The schema version does not change: `link_kind` is free text and no migration is needed. On an existing index the edges appear on the next full pass, or on the first edit of any `CommonAttributes/*.xml`, which rebuilds all configuration-level links.
+
+### Verification
+
+- Parser unit tests: `metadata_refs` (MDM format — Use/DontUse/Use → two objects, the `<v8:content>` synonym is not composition; `AutoUse = Use` with exclusions only), `edt_mdo` (`use` Use/DontUse/default, `autoUse` → `*All`/`auto`).
+- `index_extras/tests.rs`: the `MDM_Key` fixture with three items (Use, Use, DontUse) yields exactly two edges, a query by `to_object` returns `CommonAttribute.MDM_Key`; an attribute with `AutoUse = Use` yields one edge to `*All` with `from_path = 'auto'`. New incremental test: DontUse → Use arrives without a full pass, editing `ExchangePlans/<Name>.xml` keeps the plan composition (without the fix the test fails: 0 edges instead of 1), the result matches a full rebuild. Counters in the configuration-level tests include the new kind.
+- `cargo test --workspace --all-targets` — 874 passed, 0 failed; `cargo clippy -p bsl-extension --all-targets` — no new warnings.
+- Cross-check against the MDM dump (`C:\Rusin\mdm\src\cf\CommonAttributes`): `Catalog.КРБ_ВидыСудов` with `Use` is in exactly `MDM_Key`, `нсиРучноеИзменение` and `нсиЗаявка`; the only attribute with `AutoUse = Use` (`ОбластьДанныхОсновныеДанные`) holds `DontUse` exclusions only.
+- The MDM dump (`src/cf`, 25,309 files, 66 s) was indexed with this binary into a temporary directory: `common_attribute_content` for `to_object = 'Catalog.КРБ_ВидыСудов'` returns `CommonAttribute.MDM_Key`, `CommonAttribute.нсиЗаявка`, `CommonAttribute.нсиРучноеИзменение`; for all ten `CommonAttributes/*.xml` the edge count equals the number of `Use` items (282 in total, no duplicates), and `ОбластьДанныхОсновныеДанные` yields one `*All`/`auto` edge.
+- Item 2 of the spec, `exchange_plan_content` on the same dump: the `нсиСинхронизацияДанныхЧерезСервисыИнтеграции` plan has 70 edges for 70 `<Metadata>` entries in `Ext/Content.xml` (UTF-8 with BOM), and `to_object = 'Catalog.КРБ_ВидыСудов'` returns that plan. Parsing is not at fault: the "plan content not found" report in feedback 017 comes from a stale index, a query by `from_object` instead of `to_object`, or the incremental wipe of plan content fixed above.
+
 **`@tags` metatags and the module header reach search: a tag outweighs prose, a description is no longer truncated together with its tags, and "what is this module about" shows up in the object passport.**
 
 > Context. The 1C code-markup rules put a header on every module and a description with `@tags`/`@depends` metatags on every exported procedure (the `code-docs` grammar). The index did not see them: a comment was truncated to 240 characters FROM THE START, while the grammar puts tags at the end — on the 1C dump only 12 of 691,228 term rows contained the substring `@tags`. A query equal to a procedure's own tags (`весы настройки`) matched 19,238 rows and the reference procedure was not even in the top 50: the trigram query «весы» does not match «весов» in prose. The module header was not stored at all. Spec: `docs/tz-module-header-and-tags.md`.

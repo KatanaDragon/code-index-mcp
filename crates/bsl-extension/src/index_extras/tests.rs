@@ -2138,6 +2138,23 @@ fn nested_subsystem_registered_and_identifier_target_resolved() {
     );
 }
 
+/// Общий реквизит в формате выгрузки MDM: `<Content><xr:Item>` с
+/// `<xr:Metadata>`/`<xr:Use>`/`<xr:ConditionalSeparation>`, `AutoUse = DontUse`.
+const COMMON_ATTRIBUTE_MDM_KEY: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" xmlns:v8="http://v8.1c.ru/8.1/data/core" xmlns:xr="http://v8.1c.ru/8.3/xcf/readable">
+<CommonAttribute uuid="dc710ff9-bad4-4872-8484-7efd6d337849"><Properties>
+  <Name>MDM_Key</Name>
+  <Synonym><v8:item><v8:lang>ru</v8:lang><v8:content>MDM key</v8:content></v8:item></Synonym>
+  <Type><v8:Type>xs:string</v8:Type></Type>
+  <Content>
+<xr:Item><xr:Metadata>Catalog.КРБ_ВидыСудов</xr:Metadata><xr:Use>Use</xr:Use><xr:ConditionalSeparation/></xr:Item>
+<xr:Item><xr:Metadata>Catalog.Номенклатура</xr:Metadata><xr:Use>Use</xr:Use><xr:ConditionalSeparation/></xr:Item>
+<xr:Item><xr:Metadata>Document.РеализацияТоваровУслуг</xr:Metadata><xr:Use>DontUse</xr:Use><xr:ConditionalSeparation/></xr:Item>
+  </Content>
+  <AutoUse>DontUse</AutoUse>
+  <DataSeparation>DontUse</DataSeparation>
+</Properties></CommonAttribute></MetaDataObject>"#;
+
 /// Создать фикстуру конфигурации с источниками конфиг-уровня и ролью.
 fn write_config_level_fixture(repo: &Path) {
     write(
@@ -2184,6 +2201,24 @@ fn write_config_level_fixture(repo: &Path) {
 <MetaDataObject><FunctionalOption><Properties><Name>ФО</Name>
   <Location>InformationRegister.Настройки.Resource.Значение</Location>
   <Content/></Properties></FunctionalOption></MetaDataObject>"#,
+    );
+    // Общий реквизит: три элемента состава (Use, Use, DontUse) → два ребра.
+    write(
+        &repo.join("CommonAttributes").join("MDM_Key.xml"),
+        COMMON_ATTRIBUTE_MDM_KEY,
+    );
+    // Автоприменяемый общий реквизит: DontUse-исключение ребром не становится,
+    // зато есть одно ребро на *All с from_path='auto'.
+    write(
+        &repo.join("CommonAttributes").join("ОбластьДанных.xml"),
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns:xr="http://v8.1c.ru/8.3/xcf/readable"><CommonAttribute><Properties>
+  <Name>ОбластьДанных</Name>
+  <Content>
+<xr:Item><xr:Metadata>Catalog.Пользователи</xr:Metadata><xr:Use>DontUse</xr:Use><xr:ConditionalSeparation/></xr:Item>
+  </Content>
+  <AutoUse>Use</AutoUse>
+</Properties></CommonAttribute></MetaDataObject>"#,
     );
     // Роль: Read=true и Posting=false на документе.
     write(
@@ -2254,6 +2289,53 @@ fn fills_metadata_refs_and_role_rights() {
     assert_eq!(fo_to, "InformationRegister.Настройки");
     assert!(fo_path.ends_with("Resource.Значение"));
 
+    // common_attribute_content: из трёх элементов состава (Use, Use, DontUse)
+    // рёбрами становятся ровно два.
+    let ca: Vec<(String, String)> = {
+        let mut s = conn
+            .prepare(
+                "SELECT to_object, from_path FROM data_links \
+                 WHERE link_kind='common_attribute_content' \
+                 AND from_object='CommonAttribute.MDM_Key' ORDER BY to_object",
+            )
+            .unwrap();
+        let rows = s.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        rows.map(|x| x.unwrap()).collect()
+    };
+    assert_eq!(
+        ca,
+        vec![
+            ("Catalog.КРБ_ВидыСудов".to_string(), String::new()),
+            ("Catalog.Номенклатура".to_string(), String::new()),
+        ],
+        "DontUse не состав"
+    );
+    // Запрос «в каком общем реквизите объект» по to_object.
+    let by_target: String = conn
+        .query_row(
+            "SELECT from_object FROM data_links WHERE link_kind='common_attribute_content' \
+             AND to_object='Catalog.КРБ_ВидыСудов'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(by_target, "CommonAttribute.MDM_Key");
+    // AutoUse=Use: единственное ребро — на *All с from_path='auto'.
+    let auto: Vec<(String, String, i64)> = {
+        let mut s = conn
+            .prepare(
+                "SELECT to_object, from_path, is_universal FROM data_links \
+                 WHERE link_kind='common_attribute_content' \
+                 AND from_object='CommonAttribute.ОбластьДанных'",
+            )
+            .unwrap();
+        let rows = s
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap();
+        rows.map(|x| x.unwrap()).collect()
+    };
+    assert_eq!(auto, vec![("*All".to_string(), "auto".to_string(), 1)]);
+
     // role_rights: только granted (Read), Posting=false отброшен.
     let rr: Vec<(String, String, String)> = {
         let mut s = conn
@@ -2279,12 +2361,13 @@ fn fills_metadata_refs_and_role_rights() {
     let total: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM data_links WHERE link_kind IN \
-             ('subsystem_content','exchange_plan_content','defined_type_content','functional_option_location')",
+             ('subsystem_content','exchange_plan_content','defined_type_content','functional_option_location',\
+              'common_attribute_content')",
             [],
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(total, 2 + 1 + 2 + 1, "config-level data_links после повтора");
+    assert_eq!(total, 2 + 1 + 2 + 1 + 3, "config-level data_links после повтора");
     let rr_total: i64 = conn
         .query_row("SELECT COUNT(*) FROM role_rights", [], |r| r.get(0))
         .unwrap();
@@ -2306,7 +2389,8 @@ fn incremental_rebuilds_metadata_refs_and_role_rights() {
         st.conn().query_row(sql, [], |r| r.get(0)).unwrap()
     };
     let dl_sql = "SELECT COUNT(*) FROM data_links WHERE link_kind IN \
-         ('subsystem_content','exchange_plan_content','defined_type_content','functional_option_location')";
+         ('subsystem_content','exchange_plan_content','defined_type_content','functional_option_location',\
+          'common_attribute_content')";
     let rr_sql = "SELECT COUNT(*) FROM role_rights";
 
     // Меняем состав подсистемы (добавили объект) и право роли (добавили Posting=true).
@@ -2344,7 +2428,7 @@ fn incremental_rebuilds_metadata_refs_and_role_rights() {
     let mut full = fresh_storage(&tmp2);
     run_index_extras(&repo, &mut full).unwrap();
 
-    assert_eq!(cnt(&mut storage, dl_sql), 3 + 1 + 2 + 1, "data_links после инкремента");
+    assert_eq!(cnt(&mut storage, dl_sql), 3 + 1 + 2 + 1 + 3, "data_links после инкремента");
     assert_eq!(cnt(&mut storage, rr_sql), 2, "role_rights после инкремента");
     assert_eq!(
         cnt(&mut storage, dl_sql),
@@ -4474,4 +4558,60 @@ fn incremental_form_refs_and_dcs_usages_follow_file_changes() {
     run_index_extras(&repo, &mut storage).unwrap();
     assert_eq!(form_edges(&storage), inc_edges);
     assert_eq!(query_usages(&storage), inc_usages);
+}
+
+#[test]
+fn incremental_updates_common_attribute_content() {
+    // Правка общего реквизита (DontUse → Use) доезжает инкрементом; правка
+    // объектного XML плана обмена не сносит его состав (рёбра из Content.xml).
+    let tmp = TempDir::new().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    write_config_level_fixture(&repo);
+    let ep_xml = repo.join("ExchangePlans").join("Обмен.xml");
+    write(
+        &ep_xml,
+        r#"<?xml version="1.0"?>
+<MetaDataObject><ExchangePlan><Properties><Name>Обмен</Name></Properties>
+<ChildObjects/></ExchangePlan></MetaDataObject>"#,
+    );
+
+    let mut storage = fresh_storage(&tmp);
+    run_index_extras(&repo, &mut storage).unwrap();
+
+    let ca_xml = repo.join("CommonAttributes").join("MDM_Key.xml");
+    write(
+        &ca_xml,
+        &COMMON_ATTRIBUTE_MDM_KEY.replace(
+            "<xr:Metadata>Document.РеализацияТоваровУслуг</xr:Metadata><xr:Use>DontUse</xr:Use>",
+            "<xr:Metadata>Document.РеализацияТоваровУслуг</xr:Metadata><xr:Use>Use</xr:Use>",
+        ),
+    );
+    run_incremental_extras(&repo, &mut storage, &[ca_xml, ep_xml.clone()], &[]).unwrap();
+
+    let cnt = |st: &mut Storage, sql: &str| -> i64 {
+        st.conn().query_row(sql, [], |r| r.get(0)).unwrap()
+    };
+    let ca_sql = "SELECT COUNT(*) FROM data_links WHERE link_kind='common_attribute_content' \
+         AND from_object='CommonAttribute.MDM_Key'";
+    let ep_sql = "SELECT COUNT(*) FROM data_links WHERE link_kind='exchange_plan_content' \
+         AND from_object='ExchangePlan.Обмен'";
+    assert_eq!(cnt(&mut storage, ca_sql), 3, "DontUse → Use: третье ребро после инкремента");
+    assert_eq!(cnt(&mut storage, ep_sql), 1, "состав плана обмена после инкремента");
+
+    // Только объектный XML плана обмена (Content.xml не тронут): пересбора
+    // конфиг-уровня нет, состав плана всё равно должен остаться.
+    run_incremental_extras(&repo, &mut storage, &[ep_xml], &[]).unwrap();
+    assert_eq!(
+        cnt(&mut storage, ep_sql),
+        1,
+        "правка ExchangePlans/<Имя>.xml не должна сносить exchange_plan_content"
+    );
+
+    // Инкремент совпадает с полным пересбором с нуля.
+    let tmp2 = TempDir::new().unwrap();
+    let mut full = fresh_storage(&tmp2);
+    run_index_extras(&repo, &mut full).unwrap();
+    assert_eq!(cnt(&mut storage, ca_sql), cnt(&mut full, ca_sql));
+    assert_eq!(cnt(&mut storage, ep_sql), cnt(&mut full, ep_sql));
 }
