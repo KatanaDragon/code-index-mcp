@@ -12,7 +12,7 @@ use std::path::PathBuf;
 
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, Semaphore};
 
@@ -41,8 +41,11 @@ pub async fn run(processor_registry: Option<Arc<ProcessorRegistry>>) -> Result<(
     let version = env!("CARGO_PKG_VERSION").to_string();
     let pid = std::process::id();
 
-    let mut cfg = config::load_or_default()?;
+    // Путь — до загрузки: текст ошибки разбора daemon.toml файла не называет,
+    // а в журнале отказа старта нужны и файл, и причина.
     let cfg_path = paths::config_path()?;
+    let mut cfg = config::load_or_default()
+        .with_context(|| format!("конфиг {} не загружен", cfg_path.display()))?;
     tracing::info!(
         "конфиг: {} (папок: {})",
         cfg_path.display(),
@@ -643,6 +646,9 @@ async fn handle_reload(
     let cfg = match config::load_or_default() {
         Ok(c) => c,
         Err(e) => {
+            // Ответ уйдёт только вызвавшему `daemon reload`; в журнале демона
+            // без этой строки не видно, почему правка daemon.toml не применилась.
+            tracing::error!("reload: конфиг не перечитан, работаю со старым: {:#}", e);
             return ReloadResponse {
                 reloaded: false,
                 added: vec![],
@@ -764,6 +770,13 @@ fn remove_runtime_info() {
 /// либо `CODE_INDEX_HOME` не задана (значит и запускать негде).
 pub fn read_runtime_info() -> Option<RuntimeInfo> {
     let path = paths::runtime_info_file().ok()?;
+    read_runtime_info_from(&path)
+}
+
+/// Прочитать runtime-info из явно заданного файла (`<home>/daemon.json`).
+/// Нужна там, где каталог демона передаётся параметром, а не берётся из
+/// `CODE_INDEX_HOME` процесса (подсказка `daemon_offline` и её тесты).
+pub fn read_runtime_info_from(path: &std::path::Path) -> Option<RuntimeInfo> {
     let text = std::fs::read_to_string(path).ok()?;
     serde_json::from_str::<RuntimeInfo>(&text).ok()
 }

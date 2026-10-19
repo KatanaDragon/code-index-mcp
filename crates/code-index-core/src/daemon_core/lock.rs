@@ -61,7 +61,9 @@ impl Drop for DaemonPidLock {
 }
 
 /// Проверить живость процесса по PID (кроссплатформенно через sysinfo).
-fn is_process_alive(pid: u32) -> bool {
+/// Нужна и клиенту: по ней подсказка `daemon_offline` отличает «демон снят
+/// снаружи, `daemon.json` устарел» от прочих причин недоступности.
+pub(crate) fn is_process_alive(pid: u32) -> bool {
     use sysinfo::{Pid, ProcessesToUpdate, System};
     let mut sys = System::new();
     let spid = Pid::from(pid as usize);

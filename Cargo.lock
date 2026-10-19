@@ -219,6 +219,7 @@ dependencies = [
  "code-index-core",
  "rmcp",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 

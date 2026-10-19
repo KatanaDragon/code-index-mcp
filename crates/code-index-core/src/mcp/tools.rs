@@ -220,8 +220,9 @@ pub async fn check_path_status(entry: &RepoEntry) -> Option<String> {
             )),
             PathStatus::NotStarted => Some(format_unavailable(ToolUnavailable::NotStarted {
                 message: format!(
-                    "Путь {} не отслеживается демоном. Добавьте его в daemon.toml и вызовите 'code-index daemon reload'.",
-                    root.display()
+                    "Путь {} не отслеживается демоном. Добавьте его в daemon.toml и вызовите `{}`.",
+                    root.display(),
+                    client::daemon_command("reload")
                 ),
             })),
             PathStatus::Error => Some(format_unavailable(ToolUnavailable::Error {
@@ -231,10 +232,7 @@ pub async fn check_path_status(entry: &RepoEntry) -> Option<String> {
             })),
         },
         Err(e) => Some(format_unavailable(ToolUnavailable::DaemonOffline {
-            message: format!(
-                "Демон code-index не доступен ({}). Запустите 'code-index daemon run' или Scheduled Task / systemd user unit.",
-                e
-            ),
+            message: client::daemon_offline_hint(&e),
         })),
     }
 }

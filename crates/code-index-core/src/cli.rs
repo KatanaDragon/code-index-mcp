@@ -1633,7 +1633,13 @@ async fn handle_daemon(
                      проверьте переменную окружения CODE_INDEX_HOME"
                 ),
             }
-            runner::run(processor_registry).await?;
+            // Отказ старта (PID-lock, daemon.toml, порт, daemon.json) — в журнал:
+            // у отвязанного от консоли процесса stderr смотреть некому, и без
+            // этой строки демон молча завершается после «журнал демона: …».
+            if let Err(e) = runner::run(processor_registry).await {
+                tracing::error!("демон не запущен: {:#}", e);
+                return Err(e);
+            }
         }
         DaemonAction::Status { json } => match client::health().await {
             Ok(h) => {
